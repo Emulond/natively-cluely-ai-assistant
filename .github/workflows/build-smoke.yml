@@ -73,8 +73,6 @@ jobs:
     name: API Smoke (weekly)
     runs-on: macos-latest
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    schedule:
-      - cron: '0 9 * * 1'  # Every Monday at 09:00 UTC
 
     steps:
       - name: Checkout
