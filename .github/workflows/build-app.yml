@@ -1,0 +1,110 @@
+name: Build App (unsigned)
+
+# Produces installable, UNSIGNED Natively builds on GitHub-hosted runners and
+# uploads them as workflow artifacts. Unlike release-macos.yml, this needs no
+# secrets at all — no Apple Developer certificate, no App Store Connect key —
+# so it works in a fork.
+#
+# The tradeoff is that the output is not signed or notarized. macOS will warn
+# on first launch; see the README "Installation" section for the right-click >
+# Open and `xattr -cr` workarounds. The default electron-builder config already
+# targets this path (mac.identity: null, hardenedRuntime: false, and an
+# afterPack ad-hoc signing step so arm64 builds will launch at all).
+#
+# Run it from the Actions tab > Build App (unsigned) > Run workflow, then grab
+# the artifacts from the finished run's summary page.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+
+    strategy:
+      # One platform failing should not deny you the other's artifact.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macOS (arm64 + x64)
+            artifact: natively-macos
+          - os: windows-latest
+            label: Windows (x64)
+            artifact: natively-windows
+
+    steps:
+      # No `submodules: recursive` here (unlike release-macos.yml): the premium
+      # submodule is a private repo a fork cannot read, and the natively-api
+      # gitlink has no .gitmodules entry at all, so recursing would fail. The
+      # build is designed to degrade cleanly without both.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # postinstall rebuilds the native node modules against Electron's ABI and
+      # downloads the bundled ONNX models, so the packaged app works offline.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build renderer
+        run: npm run build
+
+      - name: Build Electron main process
+        run: npm run build:electron
+
+      # macOS packages both arches, so the Rust audio module must be built for
+      # both too — otherwise the x64 package ships without a loadable binary.
+      - name: Build native audio module (macOS)
+        if: runner.os == 'macOS'
+        run: npm run build:native
+        env:
+          NATIVELY_BUILD_ALL_MAC_ARCHES: '1'
+
+      - name: Build native audio module (Windows)
+        if: runner.os == 'Windows'
+        run: npm run build:native
+
+      # npm skips optional deps whose cpu constraint does not match the runner,
+      # which breaks the arch we are cross-packaging. These re-add them.
+      - name: Ensure cross-arch native dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          node scripts/ensure-sharp-mac-deps.js
+          node scripts/ensure-sqlite-vec.js
+
+      - name: Verify required local models present
+        run: node scripts/download-models.js --verify
+
+      # Invoke electron-builder directly rather than `npm run dist`: that script
+      # re-runs `npm run build`, whose rimraf can race the packager and ENOENT on
+      # dist-electron. release-macos.yml documents the same workaround.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ./node_modules/.bin/electron-builder --mac --publish never
+        env:
+          # Without this electron-builder hunts the keychain for a Developer ID
+          # and fails the build when it finds none.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: ./node_modules/.bin/electron-builder --win --x64 --publish never
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
