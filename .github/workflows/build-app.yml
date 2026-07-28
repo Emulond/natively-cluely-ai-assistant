@@ -59,10 +59,18 @@ jobs:
       - name: Package Windows installer
         run: ./node_modules/.bin/electron-builder --win --x64 --publish never
 
-      - name: Upload build
+      # Only the NSIS installer. Globbing release/*.exe also picks up the
+      # portable build, and since each carries its own Electron runtime plus the
+      # bundled ONNX models that doubled the artifact to ~2.5 GB. Add
+      # `release/*Portable*.exe` back here if you ever want the portable one.
+      #
+      # compression-level 0 because the installer is already compressed —
+      # re-zipping it costs minutes of CPU and saves almost nothing.
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: natively-windows-x64
           if-no-files-found: error
           retention-days: 14
-          path: release/*.exe
+          compression-level: 0
+          path: release/*Setup*.exe
