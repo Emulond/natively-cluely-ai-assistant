@@ -238,6 +238,7 @@ parentPort.on('message', async (msg: any) => {
       // "filesystem error: in file_size: ... encoder_model.onnx_data".
       const useExternalDataFormat: boolean | Record<string, boolean> | undefined =
         msg.useExternalDataFormat;
+      const loadT0 = Date.now();
       pipe = await pipeline('automatic-speech-recognition', msg.modelId, {
         dtype,
         session_options: sessionOptions,
@@ -255,6 +256,39 @@ parentPort.on('message', async (msg: any) => {
         },
       });
       loadedModelId = msg.modelId;
+
+      // What actually got built. pipeline() is called WITHOUT a `device`
+      // option, so transformers.js picks its own default for Node rather than
+      // honouring env.backends.onnx.executionProviders — meaning the
+      // "providers=dml,cpu" line logged above may bear no relation to the
+      // execution provider really in use. Introspect the constructed session
+      // instead of trusting what we requested. Entirely best-effort: the shape
+      // of these internals is not part of the transformers.js public API.
+      console.log(`[WhisperWorker] model READY in ${Date.now() - loadT0}ms for ${msg.modelId}`);
+      try {
+        const model: any = (pipe as any)?.model;
+        const sessions = model?.sessions ?? {};
+        const sessionNames = Object.keys(sessions);
+        const epsBySession: Record<string, unknown> = {};
+        for (const name of sessionNames) {
+          const s: any = sessions[name];
+          epsBySession[name] =
+            s?.handler?.executionProviders ??
+            s?.executionProviders ??
+            s?.handler?._executionProviders ??
+            'unknown';
+        }
+        console.log('[WhisperWorker][diag:session] ' + JSON.stringify({
+          modelClass: model?.constructor?.name ?? 'unknown',
+          sessions: sessionNames,
+          executionProviders: epsBySession,
+          requestedProviders: providers,
+          sessionOptions,
+        }));
+      } catch (introspectErr: any) {
+        console.log(`[WhisperWorker][diag:session] introspection failed (non-fatal): ${introspectErr?.message}`);
+      }
+
       // New model = stale prompt cache (different tokenizer vocab)
       cachedPromptText = '';
       cachedPromptIds = null;
@@ -334,13 +368,50 @@ parentPort.on('message', async (msg: any) => {
         opts.prompt_ids = cachedPromptIds;
       }
 
-      const result = await pipe(msg.audio, opts);
+      // `await pipe(...)` is the single point where a hang is indistinguishable
+      // from slowness from the host's perspective: no result is posted, no error
+      // is thrown, and the host only knows it dispatched audio that never came
+      // back. The watchdog below converts that silence into a running elapsed
+      // count, so a stuck inference is visibly stuck rather than merely absent.
+      const samples = (msg.audio?.length ?? 0);
+      const audioSec = (samples / 16000).toFixed(2);
+      const t0 = Date.now();
+      console.log(
+        `[WhisperWorker] transcribe START task=${msg.taskId} samples=${samples} (${audioSec}s)` +
+        ` lang=${language ?? 'auto-detect'} streaming=${streaming}` +
+        ` prompt=${opts.prompt_ids ? opts.prompt_ids.length + ' ids' : 'none'} model=${loadedModelId}`,
+      );
+      const watchdog = setInterval(() => {
+        console.warn(
+          `[WhisperWorker] transcribe STILL RUNNING task=${msg.taskId}` +
+          ` elapsed=${Date.now() - t0}ms audio=${audioSec}s — inference has not returned`,
+        );
+      }, 5000);
+      if (typeof watchdog.unref === 'function') watchdog.unref();
+
+      let result: any;
+      try {
+        result = await pipe(msg.audio, opts);
+      } finally {
+        clearInterval(watchdog);
+      }
+
+      const elapsed = Date.now() - t0;
+      const text = result?.text ?? '';
+      // realtime factor: >1 means transcription is slower than the speech
+      // itself, which is what makes results land after a meeting has ended.
+      const rtf = samples > 0 ? (elapsed / (samples / 16)).toFixed(2) : 'n/a';
+      console.log(
+        `[WhisperWorker] transcribe DONE task=${msg.taskId} elapsed=${elapsed}ms` +
+        ` realtimeFactor=${rtf}x chars=${text.length} text="${String(text).slice(0, 80)}"`,
+      );
       parentPort!.postMessage({
         type: streaming ? 'partial' : 'result',
         taskId: msg.taskId,
-        text: result.text ?? '',
+        text,
       });
     } catch (e: any) {
+      console.error(`[WhisperWorker] transcribe FAILED task=${msg.taskId}: ${e?.stack ?? e?.message ?? e}`);
       parentPort!.postMessage({
         type: 'error',
         taskId: msg.taskId,

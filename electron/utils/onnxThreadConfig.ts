@@ -98,6 +98,32 @@ function readBoolEnv(name: string, fallback: boolean): boolean {
  * 4, so a Whisper session cannot monopolise the box or reintroduce the arena
  * pressure the cap was guarding against. Both remain env-overridable.
  */
+/**
+ * Default for ORT's CPU memory arena + memory-pattern planning.
+ *
+ * Both were disabled as part of the same macOS crash mitigation as the
+ * single-thread default ("crash forensics point at BFCArena::Extend; standard
+ * system allocations are safer inside Electron"). Disabling the arena means
+ * every tensor allocation during inference goes to the raw system allocator
+ * rather than ORT's pool — for transformer decoding that is thousands of
+ * allocations per generated token, and it degrades EVERY local ONNX model, not
+ * just Whisper.
+ *
+ * The evidence that this is not merely theoretical, from one packaged Windows
+ * session: a MiniLM embedding — a tiny model that normally completes in tens of
+ * milliseconds — hit its ceiling:
+ *
+ *   [EmbeddingPipeline] embed() timed out after 30000ms for chunk 86 via local
+ *
+ * macOS keeps the conservative setting; the BFCArena crash it guards against is
+ * real and specific to that allocator. Elsewhere the arena goes back on. Both
+ * remain env-overridable, so a machine that misbehaves can be pinned back with
+ * NATIVELY_ONNX_ENABLE_CPU_MEM_ARENA=0.
+ */
+function defaultArenaEnabled(): boolean {
+    return process.platform !== 'darwin';
+}
+
 function defaultIntraOpThreads(): number {
     if (process.platform === 'darwin') return 1;
     const cores = os.cpus?.()?.length ?? 1;
@@ -113,8 +139,8 @@ export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
         // The crash forensics above point at BFCArena::Extend; standard system
         // allocations are safer inside Electron. Env vars keep this reversible
         // for perf experiments without shipping a new build.
-        enableCpuMemArena: readBoolEnv('NATIVELY_ONNX_ENABLE_CPU_MEM_ARENA', false),
-        enableMemPattern: readBoolEnv('NATIVELY_ONNX_ENABLE_MEM_PATTERN', false),
+        enableCpuMemArena: readBoolEnv('NATIVELY_ONNX_ENABLE_CPU_MEM_ARENA', defaultArenaEnabled()),
+        enableMemPattern: readBoolEnv('NATIVELY_ONNX_ENABLE_MEM_PATTERN', defaultArenaEnabled()),
     };
 }
 

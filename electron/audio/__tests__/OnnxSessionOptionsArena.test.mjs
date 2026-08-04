@@ -45,14 +45,20 @@ function withEnv(overrides, fn) {
   }
 }
 
-test('defaults disable CPU memory arena and memory pattern', () => {
+test('arena/mem-pattern default is platform-aware (off on darwin, on elsewhere)', () => {
   withEnv({
     NATIVELY_ONNX_ENABLE_CPU_MEM_ARENA: undefined,
     NATIVELY_ONNX_ENABLE_MEM_PATTERN: undefined,
   }, () => {
     const opts = getBoundedOnnxSessionOptions();
-    assert.equal(opts.enableCpuMemArena, false, 'expected CPU memory arena to be disabled by default');
-    assert.equal(opts.enableMemPattern, false, 'expected memory pattern to be disabled by default');
+    // Disabling the arena sends every inference allocation to the raw system
+    // allocator, which degrades every local ONNX model (a MiniLM embedding was
+    // measured timing out at 30s on packaged Windows). The BFCArena crash the
+    // mitigation guards against is specific to the macOS allocator, so only
+    // darwin keeps it off.
+    const expectArena = process.platform !== 'darwin';
+    assert.equal(opts.enableCpuMemArena, expectArena, 'CPU memory arena default is platform-aware');
+    assert.equal(opts.enableMemPattern, expectArena, 'memory pattern default is platform-aware');
     // Intra-op is platform-aware since the Whisper latency fix (single-threaded
     // inference measured 12.2s per segment on packaged Windows); the arena and
     // mem-pattern flags this test covers are unaffected by that change. Full
@@ -89,12 +95,17 @@ test('env overrides flip the arena/mem-pattern flags', () => {
     NATIVELY_ONNX_ENABLE_CPU_MEM_ARENA: 'bogus',
     NATIVELY_ONNX_ENABLE_MEM_PATTERN: 'bogus',
   }, () => {
-    // Unknown values must fall back to the safe default (false) — never
-    // silently flip ON. A misparse here would re-open the BFCArena path
-    // operators thought they had closed.
+    // Unknown values must fall back to the PLATFORM default and never be
+    // interpreted as an opt-in. The original intent — a misparse must not
+    // re-open the BFCArena path operators thought they had closed — is
+    // preserved exactly where that path exists: on darwin the fallback is
+    // still false. Elsewhere the arena is the default (a disabled arena was
+    // measured degrading every local ONNX model), so falling back to it is
+    // the same "use the default, ignore the garbage" behaviour.
+    const expectArena = process.platform !== 'darwin';
     const opts = getBoundedOnnxSessionOptions();
-    assert.equal(opts.enableCpuMemArena, false);
-    assert.equal(opts.enableMemPattern, false);
+    assert.equal(opts.enableCpuMemArena, expectArena);
+    assert.equal(opts.enableMemPattern, expectArena);
   });
 });
 

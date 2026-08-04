@@ -811,6 +811,16 @@ export class LocalWhisperSTT extends EventEmitter {
                 this.handleStreamingPartial(msg.text);
             } else if (msg.type === 'result') {
                 const text = filterHallucination(msg.text);
+                // A result that arrives and is then filtered to nothing is
+                // indistinguishable, from the outside, from a result that never
+                // arrived: both end in silence with no error. Log the raw length
+                // and the filter's verdict so the two can be told apart.
+                const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+                console.log(
+                    `[LocalWhisperSTT${tag}] result task=${(msg as { taskId?: string }).taskId ?? '?'}` +
+                    ` rawChars=${(msg.text ?? '').length} kept=${text ? 'yes' : 'NO (filtered as hallucination)'}` +
+                    ` raw="${String(msg.text ?? '').slice(0, 60)}"`,
+                );
                 if (text) {
                     if (this.segmentOpenedAt > 0) {
                         const dt = performance.now() - this.segmentOpenedAt;
