@@ -126,9 +126,29 @@ function readMinFreeGB(): number {
     return Number.isFinite(n) && n >= 0 ? n : 2.0;
 }
 
+// Whisper runs one session per audio channel — microphone and system audio —
+// so at most two high-priority sessions exist, both for the length of a meeting.
+//
+// Long-lived 'normal' consumers permanently occupy the shared cap: once loaded,
+// IntentClassifier (and LocalReranker) stash their release on the instance and
+// hold the slot for the process lifetime. With the default cap of 2, a loaded
+// IntentClassifier plus the FIRST Whisper channel fills it, and the SECOND
+// Whisper channel blocks on acquire for the entire meeting. In practice that
+// second channel is the microphone: system audio calls start() first and takes
+// the preloader's warm worker, so the mic is the one left queued. Its audio is
+// then discarded in dispatchFinal (no worker) — captured audio, no transcript,
+// and no error anywhere to explain it.
+//
+// 'high' priority already blocks NEW normal acquisitions, but it deliberately
+// does not preempt a RUNNING one, so that alone cannot dislodge a session held
+// for the process lifetime. Give high-priority acquisitions dedicated headroom
+// instead, bounded by the number of audio channels so concurrency stays capped.
+const HIGH_PRIORITY_RESERVED_SLOTS = 2;
+
 function canAcquireNow(priority: OnnxSlotPriority): boolean {
     const cap = readMaxConcurrent();
     if (priority === 'high') {
+        if (inFlightHigh < HIGH_PRIORITY_RESERVED_SLOTS) return true;
         return inFlightNormal + inFlightHigh < cap;
     }
     // Normal priority: only acquire when there are no high-priority waiters
@@ -149,14 +169,31 @@ function canAcquireNow(priority: OnnxSlotPriority): boolean {
  */
 export async function acquireOnnxSlot(priority: OnnxSlotPriority = 'normal'): Promise<() => void> {
     const queue = priority === 'high' ? waitersHigh : waitersNormal;
+    // Diagnostics: a caller blocked here is invisible from the outside — it has
+    // not logged yet and never errors, so a starved Whisper instance looks
+    // identical to one that was never started. Record how long each acquisition
+    // actually waits, and against whom.
+    const waitStartedAt = Date.now();
+    let didWait = false;
     // Only enqueue when we're actually going to wait — otherwise stale
     // resolvers accumulate in the queue and confuse the FIFO order.
     while (!canAcquireNow(priority)) {
+        if (!didWait) {
+            didWait = true;
+            console.warn(
+                `[OnnxSlot] ${priority} acquisition BLOCKED — cap=${readMaxConcurrent()}` +
+                ` inFlight(high=${inFlightHigh}, normal=${inFlightNormal})` +
+                ` queued(high=${waitersHigh.length}, normal=${waitersNormal.length})`,
+            );
+        }
         const waiterP = new Promise<void>(resolve => queue.push(resolve));
         await waiterP;
     }
     if (priority === 'high') inFlightHigh++;
     else inFlightNormal++;
+    if (didWait) {
+        console.warn(`[OnnxSlot] ${priority} acquisition granted after ${Date.now() - waitStartedAt}ms`);
+    }
 
     let released = false;
     return () => {
@@ -164,6 +201,12 @@ export async function acquireOnnxSlot(priority: OnnxSlotPriority = 'normal'): Pr
         released = true;
         if (priority === 'high') inFlightHigh--;
         else inFlightNormal--;
+        if (didWait || waitersHigh.length > 0 || waitersNormal.length > 0) {
+            console.log(
+                `[OnnxSlot] ${priority} released — inFlight(high=${inFlightHigh}, normal=${inFlightNormal})` +
+                ` queued(high=${waitersHigh.length}, normal=${waitersNormal.length})`,
+            );
+        }
         // Wake the next eligible waiter. Try high first, then normal — keeps
         // Whisper latency-critical even when embeddings are queued.
         const nextHigh = waitersHigh.shift();
