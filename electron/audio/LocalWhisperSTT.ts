@@ -95,6 +95,7 @@ export class LocalWhisperSTT extends EventEmitter {
     private diagChunks = 0;
     private diagDroppedInactive = 0;
     private diagDroppedNoWorker = 0;
+    private diagDroppedBackpressure = 0;
     private diagSegments = 0;
     private diagDispatched = 0;
     private diagPeakRms = 0;
@@ -125,11 +126,13 @@ export class LocalWhisperSTT extends EventEmitter {
             ` segments=${this.diagSegments} dispatched=${this.diagDispatched}` +
             ` pending=${this.pendingAudio.length}` +
             ` droppedInactive=${this.diagDroppedInactive} droppedNoWorker=${this.diagDroppedNoWorker}` +
+            ` droppedBackpressure=${this.diagDroppedBackpressure} inFlight=${this.inFlightTranscribes}` +
             ` | active=${this.isActive} vad=${!!this.vad} worker=${!!this.worker} ready=${this.workerReady}`,
         );
         this.diagChunks = 0;
         this.diagDroppedInactive = 0;
         this.diagDroppedNoWorker = 0;
+        this.diagDroppedBackpressure = 0;
         this.diagSegments = 0;
         this.diagDispatched = 0;
         this.diagPeakRms = 0;
@@ -459,6 +462,11 @@ export class LocalWhisperSTT extends EventEmitter {
             if (!this.streamingTaskInFlight) return;
             console.warn(`[LocalWhisperSTT] Streaming watchdog fired after ${LocalWhisperSTT.STREAMING_WATCHDOG_MS}ms — worker is stuck, force-clearing in-flight task`);
             const stuckTaskId = this.streamingTaskId;
+            // The stuck task will never resolve, so release its occupancy slot
+            // too — otherwise inFlightTranscribes only ever climbs and the
+            // backpressure check would permanently block all future dispatch,
+            // converting a slow worker into a silent one.
+            this.noteTranscribeResolved();
             this.streamingTaskInFlight = false;
             this.streamingTaskId = null;
             this.streamingStallCount = 0;
@@ -486,6 +494,10 @@ export class LocalWhisperSTT extends EventEmitter {
         if (!this.vad.isInSpeech()) { this.recordStreamingStall(); return; }
         // Don't stack streaming requests — wait for the previous one to finish.
         if (this.streamingTaskInFlight) { this.recordStreamingStall(); return; }
+        // Real occupancy check. A streaming pass is a disposable live preview,
+        // so when the worker is already busy the right move is to skip this
+        // tick entirely rather than lengthen its queue.
+        if (this.inFlightTranscribes > 0) { this.recordStreamingStall(); return; }
 
         const open = this.vad.peekOpenSegment();
         if (!open || open.durationMs < this.streamingMinAudioMs) {
@@ -682,6 +694,19 @@ export class LocalWhisperSTT extends EventEmitter {
             return;
         }
 
+        if (this.inFlightTranscribes >= LocalWhisperSTT.MAX_INFLIGHT_TRANSCRIBES) {
+            // Dropping a final loses a phrase, which is bad — but queueing it
+            // behind an already-saturated worker loses it anyway (it would
+            // surface tens of seconds late) AND delays every phrase after it.
+            // Fail visibly on the phrase rather than invisibly on the session.
+            this.diagDroppedBackpressure++;
+            console.warn(
+                `[LocalWhisperSTT${this.channelLabel ? ':' + this.channelLabel : ''}] ` +
+                `dropping a final segment — ${this.inFlightTranscribes} transcriptions already queued ` +
+                `(inference is slower than speech; use a smaller model or enable GPU)`,
+            );
+            return;
+        }
         if (this.isDrainingFinals) {
             this.drainingFinalsInFlight++;
         }
@@ -692,10 +717,49 @@ export class LocalWhisperSTT extends EventEmitter {
         if (!this.worker) return;
         const taskId = `${streaming ? 's' : 't'}${++this.taskCounter}`;
         const copy = audio.slice();
+        this.inFlightTranscribes++;
         this.worker.postMessage(
             { type: 'transcribe', taskId, audio: copy, language: this.language, streaming },
             [copy.buffer]
         );
+    }
+
+    /**
+     * Number of transcribe messages posted to the worker but not yet resolved.
+     *
+     * streamingTaskInFlight alone does NOT describe worker occupancy:
+     * dispatchFinal CLEARS it and then posts a final, so the streaming loop
+     * immediately believes the worker is free and ticks again — while the
+     * worker is still busy with both. The worker handles messages serially, so
+     * every extra post just lengthens a queue.
+     *
+     * With inference slower than speech, that queue grows without bound.
+     * Observed on a packaged build, three tasks outstanding at once and the
+     * oldest starved:
+     *
+     *   transcribe STILL RUNNING task=t2 elapsed=14477ms
+     *   transcribe STILL RUNNING task=s3 elapsed=8729ms
+     *   transcribe STILL RUNNING task=t4 elapsed=8507ms
+     *   transcribe STILL RUNNING task=s3 elapsed=188972ms   <- 3+ minutes
+     *
+     * A result 189 seconds late is worthless, and producing it starves every
+     * later utterance. This counter is the real occupancy signal used to apply
+     * backpressure. It is never allowed below zero: a watchdog force-clear or a
+     * late message must not corrupt it into permanently blocking dispatch.
+     */
+    private inFlightTranscribes = 0;
+
+    /**
+     * Outstanding finals beyond which new ones are dropped rather than queued.
+     * Finals carry the actual transcript so they are not dropped lightly, but a
+     * third queued final lands ~30s late at observed speeds — long after the
+     * words matter — while delaying everything behind it. On a healthy setup
+     * (GPU, or a small model) inference outruns speech and this never trips.
+     */
+    private static readonly MAX_INFLIGHT_TRANSCRIBES = 2;
+
+    private noteTranscribeResolved(): void {
+        this.inFlightTranscribes = Math.max(0, this.inFlightTranscribes - 1);
     }
 
     /* ──────────────── Worker lifecycle ──────────────── */
@@ -804,12 +868,14 @@ export class LocalWhisperSTT extends EventEmitter {
                 // agreement baseline is reset on every final dispatch and the
                 // taskId is invalidated, so a late partial would otherwise
                 // corrupt the next segment.
+                this.noteTranscribeResolved();
                 if (msg.taskId !== this.streamingTaskId) {
                     this.streamingTaskInFlight = false;
                     return;
                 }
                 this.handleStreamingPartial(msg.text);
             } else if (msg.type === 'result') {
+                this.noteTranscribeResolved();
                 const text = filterHallucination(msg.text);
                 // A result that arrives and is then filtered to nothing is
                 // indistinguishable, from the outside, from a result that never
@@ -841,6 +907,7 @@ export class LocalWhisperSTT extends EventEmitter {
                     }
                 }
             } else if (msg.type === 'error') {
+                this.noteTranscribeResolved();
                 console.error('[LocalWhisperSTT] Worker error:', msg.message);
                 if (this.isDrainingFinals && msg.taskId?.startsWith('t')) {
                     this.drainingFinalsInFlight = Math.max(0, this.drainingFinalsInFlight - 1);
