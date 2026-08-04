@@ -151,8 +151,37 @@ function resolveAppleSiliconDtype(): string | Record<string, string> | null {
     }
 }
 
+/**
+ * Cross-platform dtype override via NATIVELY_WHISPER_DTYPE.
+ *
+ * The default keeps the encoder at fp32 for accuracy, but the encoder is the
+ * dominant cost of a Whisper pass: it runs over a full 30-SECOND mel window
+ * every time, however briefly the user actually spoke. On CPU that is what
+ * makes short utterances expensive — a measured 6959ms for 0.81s of speech on
+ * whisper-small (realtimeFactor 8.59x).
+ *
+ * Quantizing the encoder is the standard trade for realtime use, so this exists
+ * to make that reachable without a rebuild:
+ *
+ *   NATIVELY_WHISPER_DTYPE=q8    — quantize everything, encoder included
+ *   NATIVELY_WHISPER_DTYPE=fp32  — uniform fp32 (maximum accuracy)
+ *   NATIVELY_WHISPER_DTYPE=mixed — the shipped default (fp32 encoder, q8 decoders)
+ *
+ * Deliberately NOT the default: it costs word accuracy, and that is a product
+ * decision rather than one to make silently on a user's behalf.
+ */
+function resolveEnvDtype(): string | Record<string, string> | null {
+    const raw = (process.env.NATIVELY_WHISPER_DTYPE ?? '').trim().toLowerCase();
+    if (!raw) return null;
+    if (raw === 'mixed') return WHISPER_SAFE_DTYPE;
+    if (raw === 'q8' || raw === 'fp32' || raw === 'q4' || raw === 'int8' || raw === 'fp16') return raw;
+    console.warn(`[inferenceConfig] NATIVELY_WHISPER_DTYPE="${raw}" not recognised — using the platform default`);
+    return null;
+}
+
 export function resolveInferenceConfig(): InferenceConfig {
     const { platform, arch } = process;
+    const envDtype = resolveEnvDtype();
 
     if (platform === 'darwin' && arch === 'arm64') {
         // Apple Silicon — CoreML uses Metal GPU + ANE. Default changed in
@@ -164,7 +193,7 @@ export function resolveInferenceConfig(): InferenceConfig {
         const override = resolveAppleSiliconDtype();
         return {
             executionProviders: ['coreml', 'cpu'],
-            dtype: override ?? WHISPER_SAFE_DTYPE,
+            dtype: envDtype ?? override ?? WHISPER_SAFE_DTYPE,
         };
     }
 
@@ -172,10 +201,10 @@ export function resolveInferenceConfig(): InferenceConfig {
         // Windows — DirectML over NVIDIA / AMD / Intel GPUs. Per-module dtype
         // gives best accuracy/speed tradeoff for the larger Whisper/Distil
         // checkpoints; DirectML handles mixed precision via session options.
-        return { executionProviders: ['dml', 'cpu'], dtype: WHISPER_SAFE_DTYPE };
+        return { executionProviders: ['dml', 'cpu'], dtype: envDtype ?? WHISPER_SAFE_DTYPE };
     }
 
     // Intel Mac, Linux, unknown — CPU. Per-module gives a real speedup on
     // decoder-heavy inference without sacrificing encoder accuracy.
-    return { executionProviders: ['cpu'], dtype: WHISPER_SAFE_DTYPE };
+    return { executionProviders: ['cpu'], dtype: envDtype ?? WHISPER_SAFE_DTYPE };
 }

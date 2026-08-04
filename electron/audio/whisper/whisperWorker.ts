@@ -251,8 +251,25 @@ parentPort.on('message', async (msg: any) => {
       // Only pass devices transformers.js actually knows (DEVICE_TYPES). Notably
       // 'coreml' is NOT one of them, so macOS keeps the previous behaviour of
       // letting the library choose rather than being handed an invalid value.
+      // GPU devices are OPT-IN, never derived from resolveInferenceConfig().
+      //
+      // Passing device='dml' (the provider Windows asks for) killed the app at
+      // startup: the log ends immediately after "building pipeline with
+      // device=dml", with no 'model READY' and no fallback line. DirectML
+      // failing to initialise aborts the PROCESS — it is a native crash, not a
+      // JS throw — so the try/catch below cannot rescue it. A GPU provider that
+      // takes the whole app down with it is strictly worse than slow CPU
+      // inference, so it cannot be the default.
+      //
+      // Set NATIVELY_ONNX_DEVICE=dml (or cuda/webgpu) to opt in on a machine
+      // where it is known to work. Unset, transformers.js picks its own Node
+      // default, which is the behaviour that has always shipped.
       const SUPPORTED_DEVICES = new Set(['cpu', 'dml', 'cuda', 'webgpu', 'gpu', 'auto']);
-      const preferredDevice = providers.find((p) => SUPPORTED_DEVICES.has(p));
+      const requestedDevice = (process.env.NATIVELY_ONNX_DEVICE ?? '').trim().toLowerCase();
+      const preferredDevice = SUPPORTED_DEVICES.has(requestedDevice) ? requestedDevice : undefined;
+      if (requestedDevice && !preferredDevice) {
+        console.warn(`[WhisperWorker] NATIVELY_ONNX_DEVICE="${requestedDevice}" is not a device transformers.js accepts — ignoring`);
+      }
 
       const buildPipeline = (device?: string) => pipeline('automatic-speech-recognition', msg.modelId, {
         dtype,
