@@ -81,6 +81,59 @@ export class LocalWhisperSTT extends EventEmitter {
     // Optional channel label ('mic' / 'system') — disambiguates log lines
     // when both LocalWhisperSTT instances run the same model.
     private channelLabel = '';
+
+    // ── Pipeline diagnostics ────────────────────────────────────────────────
+    // The audio path has three points that drop a chunk with no trace:
+    //   1. write()        — returns early when !isActive || !vad
+    //   2. VadProcessor   — emits no segment when RMS stays under 0.008
+    //   3. dispatchFinal  — returns early when !worker
+    // All three produce the same user-visible symptom (audio captured, no
+    // transcript, no error), so a report that cannot distinguish them is
+    // useless. These counters attribute the loss to exactly one stage, and
+    // carry the observed signal level so "too quiet for VAD" is separable
+    // from "VAD fine, nothing downstream".
+    private diagChunks = 0;
+    private diagDroppedInactive = 0;
+    private diagDroppedNoWorker = 0;
+    private diagSegments = 0;
+    private diagDispatched = 0;
+    private diagPeakRms = 0;
+    private diagLastReportAt = 0;
+    private static readonly DIAG_REPORT_MS = 5000;
+
+    /** Cheap strided RMS over the resampled window, for VAD-threshold comparison. */
+    private static rmsOf(samples: Float32Array): number {
+        if (samples.length === 0) return 0;
+        const stride = Math.max(1, samples.length >> 8);
+        let sum = 0, n = 0;
+        for (let i = 0; i < samples.length; i += stride) { sum += samples[i] * samples[i]; n++; }
+        return n ? Math.sqrt(sum / n) : 0;
+    }
+
+    private diagReport(force = false): void {
+        const now = performance.now();
+        if (this.diagLastReportAt === 0) this.diagLastReportAt = now;
+        if (!force && now - this.diagLastReportAt < LocalWhisperSTT.DIAG_REPORT_MS) return;
+        this.diagLastReportAt = now;
+        const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+        // peakRms vs VAD's 0.008 threshold is the single most diagnostic number
+        // here: above it with segments=0 means VAD is misbehaving; below it
+        // means the mic signal is genuinely too quiet to be treated as speech.
+        console.log(
+            `[LocalWhisperSTT${tag}] pipeline · chunks=${this.diagChunks}` +
+            ` peakRms=${this.diagPeakRms.toFixed(5)} (vadThreshold=0.008)` +
+            ` segments=${this.diagSegments} dispatched=${this.diagDispatched}` +
+            ` pending=${this.pendingAudio.length}` +
+            ` droppedInactive=${this.diagDroppedInactive} droppedNoWorker=${this.diagDroppedNoWorker}` +
+            ` | active=${this.isActive} vad=${!!this.vad} worker=${!!this.worker} ready=${this.workerReady}`,
+        );
+        this.diagChunks = 0;
+        this.diagDroppedInactive = 0;
+        this.diagDroppedNoWorker = 0;
+        this.diagSegments = 0;
+        this.diagDispatched = 0;
+        this.diagPeakRms = 0;
+    }
     private worker: Worker | null = null;
     private vad: VadProcessor | null = null;
     private isActive = false;
@@ -284,9 +337,21 @@ export class LocalWhisperSTT extends EventEmitter {
     }
 
     write(chunk: Buffer): void {
-        if (!this.isActive || !this.vad) return;
+        this.diagChunks++;
+        if (!this.isActive || !this.vad) {
+            // Stage 1 drop. Reached when start() was never called, or when
+            // spawnWorker failed and tore the instance back down — the audio
+            // is captured and then discarded here, with no other signal.
+            this.diagDroppedInactive++;
+            this.diagReport();
+            return;
+        }
         const f32 = resampleToF32(chunk, this.inputSampleRate);
+        const rms = LocalWhisperSTT.rmsOf(f32);
+        if (rms > this.diagPeakRms) this.diagPeakRms = rms;
         const segs = this.vad.push(f32);
+        this.diagSegments += segs.length;
+        this.diagReport();
         segs.forEach(s => this.dispatchFinal(s.samples));
 
         // Soft-commit: if a segment has grown past MAX_SEGMENT_MS, force a
@@ -573,7 +638,13 @@ export class LocalWhisperSTT extends EventEmitter {
     /* ──────────────── Final segment dispatch ──────────────── */
 
     private dispatchFinal(audio: Float32Array): void {
-        if (!this.worker) return;
+        if (!this.worker) {
+            // Stage 3 drop. VAD produced a real segment but there is no worker
+            // to transcribe it — the segment is lost silently.
+            this.diagDroppedNoWorker++;
+            return;
+        }
+        this.diagDispatched++;
 
         // A final pass closes the streaming window — clear agreement state so
         // the next segment starts clean.
