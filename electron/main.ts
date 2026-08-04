@@ -318,6 +318,67 @@ process.on('SIGHUP', () => {
   // No exit on SIGHUP — terminal disconnect shouldn't kill a desktop app.
 });
 
+// ── Crash capture for deaths that leave no trace ──────────────────────────
+//
+// Three failure modes reported with NOTHING in natively_debug.log:
+//   - the app dying so early the log file was never opened;
+//   - the settings window going unresponsive and then vanishing;
+//   - the whole app disappearing moments after launch.
+//
+// uncaughtException/unhandledRejection above only cover the MAIN process's JS.
+// A renderer or GPU process dying, or a native abort inside a child process,
+// bypasses them entirely — the app disappears and the log simply stops, which
+// is exactly what was observed. Electron surfaces those as app-level events;
+// nothing was listening.
+//
+// bootMarker is written synchronously next to the debug log before any window
+// or native module work. If a crash report shows no log at all but the marker
+// exists, the failure is between process start and log initialisation — a fact
+// that otherwise cannot be established from the outside.
+function crashLogPath(name: string): string | null {
+    try {
+        return path.join(app.getPath('documents'), name);
+    } catch {
+        const home = os.homedir?.();
+        return home ? path.join(home, 'Documents', name) : null;
+    }
+}
+
+function writeBootMarker(stage: string): void {
+    try {
+        const p = crashLogPath('natively_boot_marker.log');
+        if (!p) return;
+        fs.appendFileSync(p, `${new Date().toISOString()} [boot] ${stage} pid=${process.pid} electron=${process.versions.electron}\n`);
+    } catch { /* never let diagnostics break startup */ }
+}
+writeBootMarker('main.ts module evaluated');
+
+app.on('render-process-gone', (_event, webContents, details) => {
+    const title = (() => { try { return webContents.getTitle(); } catch { return 'unknown'; } })();
+    const url = (() => { try { return webContents.getURL(); } catch { return 'unknown'; } })();
+    const line = `[CRASH] render-process-gone reason=${details.reason} exitCode=${details.exitCode} title="${title}" url="${url}"`;
+    try { console.error(line); } catch { /* ignore */ }
+    logToFile(line);
+    writeBootMarker(`render-process-gone reason=${details.reason} exitCode=${details.exitCode}`);
+});
+
+app.on('child-process-gone', (_event, details) => {
+    // Covers the GPU process, utility processes and the ONNX/native side —
+    // a DirectML abort surfaces here rather than as a JS exception.
+    const line = `[CRASH] child-process-gone type=${details.type} reason=${details.reason} exitCode=${details.exitCode}` +
+        `${details.serviceName ? ` service=${details.serviceName}` : ''}${details.name ? ` name=${details.name}` : ''}`;
+    try { console.error(line); } catch { /* ignore */ }
+    logToFile(line);
+    writeBootMarker(`child-process-gone type=${details.type} reason=${details.reason}`);
+});
+
+// Deliberately NOT hooking before-quit/will-quit: those handlers have ordering
+// requirements of their own (DefaultOutputWatcher shutdown must precede
+// OllamaManager.stop, pinned by tests), and process 'exit' already records the
+// shutdown — a clean exit here versus no line at all is what separates "quit"
+// from "killed".
+process.on('exit', (code) => { writeBootMarker(`process exit code=${code}`); });
+
 // CQ-04 fix: do NOT call app.getPath() at module load time.
 // app.getPath('documents') is not guaranteed to be available before app.whenReady().
 // Use a lazy getter instead — the path is resolved on first logToFile() call.
@@ -4837,11 +4898,36 @@ export class AppState {
       return Math.min(rms / 10000, 1.0);
     };
 
+    // The mic test computed a level and sent it to the meter, but never logged
+    // it — so a device that opens cleanly and then delivers pure silence looked
+    // identical, in the log, to one working perfectly. That is precisely the
+    // case being chased for virtual-audio devices, whose routing lives outside
+    // this app: chunks arrive on schedule, carrying nothing. Summarise each
+    // probe (peak + mean over ~2s) so the log distinguishes "device silent"
+    // from "device not opened" without needing the meter on screen.
+    let micTestPeak = 0;
+    let micTestSum = 0;
+    let micTestCount = 0;
+    let micTestLastLogAt = 0;
     const attachAudioTestListeners = (capture: MicrophoneCapture) => {
       capture.on('data', (chunk: Buffer) => {
+        const level = computeRmsLevel(chunk);
+        micTestPeak = Math.max(micTestPeak, level);
+        micTestSum += level;
+        micTestCount++;
+        const now = Date.now();
+        if (micTestLastLogAt === 0) micTestLastLogAt = now;
+        if (now - micTestLastLogAt >= 2000) {
+          const mean = micTestCount > 0 ? micTestSum / micTestCount : 0;
+          console.log(
+            `[AudioTest:mic] level peak=${micTestPeak.toFixed(4)} mean=${mean.toFixed(4)} ` +
+            `chunks=${micTestCount} bytes/chunk=${chunk.length} ` +
+            `${micTestPeak < 0.001 ? '— SILENT: the device opened but is delivering no signal' : ''}`,
+          );
+          micTestPeak = 0; micTestSum = 0; micTestCount = 0; micTestLastLogAt = now;
+        }
         const targets = broadcastTargets();
         if (targets.length === 0) return;
-        const level = computeRmsLevel(chunk);
         for (const target of targets) {
           this.sendToWindow(target, 'audio-test-level', level);
         }

@@ -45,7 +45,7 @@ describe('ONNX session thread defaults', () => {
     const opts = getBoundedOnnxSessionOptions();
 
     // Leave 2 threads for UI/audio/Electron, take the rest, capped at 8.
-    const expected = Math.max(1, Math.min(8, cores - 2));
+    const expected = Math.max(1, cores - 2);
     assert.equal(
       opts.intraOpNumThreads,
       expected,
@@ -61,13 +61,17 @@ describe('ONNX session thread defaults', () => {
     }
   });
 
-  test('stays bounded — never exceeds 8 threads however many cores exist', async () => {
+  test('always leaves headroom — never claims every logical processor', async () => {
     const { getBoundedOnnxSessionOptions } = await import(MODULE_URL);
+    const cores = os.cpus()?.length ?? 1;
     const opts = getBoundedOnnxSessionOptions();
-    assert.ok(
-      opts.intraOpNumThreads >= 1 && opts.intraOpNumThreads <= 8,
-      `intraOpNumThreads must stay within 1..8, got ${opts.intraOpNumThreads}`,
-    );
+    assert.ok(opts.intraOpNumThreads >= 1, 'must always be at least 1');
+    if (cores > 2) {
+      assert.ok(
+        opts.intraOpNumThreads < cores,
+        'UI, audio capture and the rest of Electron still need a thread to run on',
+      );
+    }
   });
 
   test('env override still wins, so a bad machine can be pinned back to 1', async () => {

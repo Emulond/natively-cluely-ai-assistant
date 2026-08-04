@@ -136,7 +136,13 @@ function defaultIntraOpThreads(): number {
     // take the rest. Capped at 8: past that, ONNX's own coordination overhead
     // starts eating the gain on a consumer CPU, and two channels can be live at
     // once (mic + system audio), each with its own session.
-    return Math.max(1, Math.min(8, cores - 2));
+    // os.cpus() reports LOGICAL processors (12 on a 6-core/12-thread i5-11260H),
+    // and ONNX scales on physical cores rather than SMT siblings — so leaving
+    // two aside still hands inference more threads than the machine has real
+    // cores. No upper cap: transcription is the foreground task the user is
+    // waiting on, and NATIVELY_ONNX_INTRA_OP_THREADS pins it if a machine
+    // prefers otherwise.
+    return Math.max(1, cores - 2);
 }
 
 export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {

@@ -329,9 +329,20 @@ parentPort.on('message', async (msg: any) => {
       } else if (GPU_DEVICES.has(requestedDevice)) {
         chosenDevice = requestedDevice;
         chosenDeviceId = deviceId;
-      } else if (isWindows) {
+      } else if (isWindows && (process.env.NATIVELY_ONNX_GPU_LADDER ?? '') === '1') {
+        // OFF BY DEFAULT. The automatic ladder crashed the app on launch, and
+        // the sentinel could not save it: a native DirectML abort can kill the
+        // process before the sentinel write reaches disk, so the next start
+        // reads no record, tries the same adapter, and crashes again — an
+        // unopenable app rather than the one-crash-then-fallback this was
+        // supposed to guarantee.
+        //
+        // An app that will not open is worse than one that transcribes slowly,
+        // so GPU stays opt-in until the attempt itself can be made survivable
+        // (a probe in a throwaway child process, whose death is observable
+        // instead of fatal).
         chosenDevice = 'dml';
-        chosenDeviceId = deviceId ?? 1; // discrete GPU first
+        chosenDeviceId = deviceId ?? 1;
       }
 
       if (chosenDevice) {
