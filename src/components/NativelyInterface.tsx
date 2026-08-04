@@ -1,6 +1,7 @@
 import { animate, AnimatePresence, motion, useMotionValue, useTransform } from 'framer-motion';
 import {
   ArrowRight,
+  ArrowDown,
   ChevronDown,
   Code,
   Copy,
@@ -24,6 +25,7 @@ import {
   mergeRollingTranscriptPartial,
 } from '../../electron/utils/rollingTranscriptState.ts';
 import { categorizeSttError } from '../lib/sttErrorMapper';
+import { splitGistLine, splitGistLineStreaming, collapseBlockGaps } from '../lib/displayMarkup';
 
 import type { SkillSummary } from '../types/electron';
 
@@ -239,6 +241,7 @@ import {
   shouldDedupeOverlayAction,
 } from '../lib/overlayActionDedup.mjs';
 import { shouldDedupeManualSubmit } from '../lib/overlaySubmitDedup.mjs';
+import { decideScrollInterrupt } from '../lib/scrollInterruptDecision.mjs';
 import { mergeTranscriptChunks } from '../lib/transcriptMerge.mjs';
 import {
   applyWhatToAnswerNullFeedbackMessages,
@@ -316,9 +319,8 @@ import { getCodexCliModelDisplayName } from '../utils/modelUtils';
 import { getModifierSymbol, isMac } from '../utils/platformUtils';
 import { DynamicActionBar } from './dynamic-actions/DynamicActionBar';
 import GlassEffectLayer from './ui/GlassEffectLayer';
-import ResizeToggle from './ui/ResizeToggle';
+import { OverlayBanner, OverlayBannerButton } from './ui/OverlayBanner';
 import RollingTranscript from './ui/RollingTranscript';
-import TopPill from './ui/TopPill';
 
 // PERF: hoisted plugin arrays. ReactMarkdown receives `remarkPlugins` and
 // `rehypePlugins` as new array literals if defined inline at the call site —
@@ -886,7 +888,16 @@ const MessageRow = React.memo(
         >
           <div
             className={`
-              min-w-0 ${bubbleMaxClass} text-[15px] leading-relaxed relative group whitespace-pre-wrap
+              min-w-0 ${bubbleMaxClass} text-[15px] leading-relaxed relative group ${
+                /* whitespace-pre-wrap must NOT sit on the system bubble: white-space
+                   inherits, and system messages render markdown whose renderers
+                   (react-markdown AND marked) emit literal "\n" text nodes BETWEEN
+                   block elements — under inherited pre-wrap each one paints as an
+                   extra blank line stacked on the block margins (the "two line gap"
+                   report, 2026-08-02). Sub-surfaces that need pre-wrap declare it
+                   themselves (mdComponents p, streaming divs, plain-text handoff). */
+                msg.role === 'system' ? '' : 'whitespace-pre-wrap'
+              }
               ${
                 msg.role === 'user'
                   ? isLightTheme
@@ -996,11 +1007,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     const stored = localStorage.getItem('natively_interviewer_transcript');
     return stored !== 'false';
   });
-  const [autoScroll, setAutoScroll] = useState(() => {
-    const stored = localStorage.getItem('natively_auto_scroll');
-    return stored !== 'false';
-  });
-
   // Analytics State
   const requestStartTimeRef = useRef<number | null>(null);
 
@@ -1213,16 +1219,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     return () => window.removeEventListener('storage', handleStorage);
   }, []);
 
-  // Sync auto-scroll setting
-  useEffect(() => {
-    const handleStorage = () => {
-      const stored = localStorage.getItem('natively_auto_scroll');
-      setAutoScroll(stored !== 'false');
-    };
-    window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
-  }, []);
-
   // Interrupt-aware auto-scroll (see the streaming effect below + the
   // rAF-coalesced scroll listener further down). Every write to
   // scrollContainerRef's scrollTop — ours or the user's native scroll —
@@ -1282,9 +1278,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     return suppressedId !== null && (streamingId === null || streamingId === suppressedId);
   }, []);
 
-  // Auto-scroll to bottom on every messages update when toggle is enabled.
-  // A direct scrollTop write (matching pinScrollBottomIfNeeded's style, see
-  // line ~2376) instead of scrollIntoView({ behavior: 'auto' }): the
+  // Auto-scroll to bottom on every messages update, unless a scroll-up
+  // interrupt is currently active for this message (see isAutoScrollSuppressed
+  // above). A direct scrollTop write (matching pinScrollBottomIfNeeded's
+  // style, declared further below) instead of scrollIntoView({ behavior:
+  // 'auto' }): the
   // interrupt-detection scroll handler needs to know the EXACT value we just
   // wrote so it can tell our own programmatic scroll apart from a user
   // scroll on the very next frame, and scrollIntoView doesn't hand that back
@@ -1301,7 +1299,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // genuinely NEW message carries a different (non-null) streaming id, so
   // suppression naturally lifts without any explicit "new message" handling.
   useEffect(() => {
-    if (!autoScroll) return;
     if (messages.length === 0) return;
     if (isAutoScrollSuppressed()) return;
     // Not (or no longer) suppressed — clear any stale suppression/pill state
@@ -1319,7 +1316,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       c.scrollTop = c.scrollHeight - c.clientHeight;
       lastScrollTopRef.current = c.scrollTop;
     }
-  }, [messages, autoScroll, setJumpToLatestVisible, isAutoScrollSuppressed]);
+  }, [messages, setJumpToLatestVisible, isAutoScrollSuppressed]);
 
   const hasActiveSystemAnswer = useMemo(
     () =>
@@ -1415,7 +1412,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const [stealthHotkeyConflict, setStealthHotkeyConflict] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const resizeToggleRef = useRef<HTMLButtonElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const rafDimUpdateRef = useRef<number | null>(null);
   const codeExpandedRef = useRef(false);
@@ -1436,16 +1432,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       : false,
   );
   // Wall-clock deadline until which the CSS width animation is running. The OS
-  // window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 780) and never width-resizes;
-  // only the CSS panel animates 600↔780 centered inside it. But that CSS width
-  // change reflows content HEIGHT every frame, firing the ResizeObserver ~60×,
-  // and a height setBounds on every one re-rasterizes the transparent backdrop-
-  // blur window → flicker. So while now < this deadline the ResizeObserver's own
-  // height reporting is SUPPRESSED; the width animation instead drives a single
-  // RATE-LIMITED (~30fps) height channel itself + one authoritative settle at
-  // onComplete (see startTransition). (Width is never reported as anything but
-  // the fixed 780, so there is no width setBounds to suppress — that is the
-  // whole point of the fix.)
+  // window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 732) and never
+  // width-resizes; only the CSS panel animates 600↔732 centered inside it.
+  // But that CSS width change reflows content HEIGHT every frame, firing the
+  // ResizeObserver ~60×, and a height setBounds on every one re-rasterizes
+  // the transparent backdrop-blur window → flicker. So while now < this
+  // deadline the ResizeObserver's own height reporting is SUPPRESSED; the
+  // width animation instead drives a single RATE-LIMITED (~30fps) height
+  // channel itself + one authoritative settle at onComplete (see
+  // startTransition). (Width is never reported as anything but the fixed 732,
+  // so there is no width setBounds to suppress — that is the whole point.)
   //
   // A self-expiring DEADLINE (not a boolean cleared by framer's onComplete) is
   // deliberate: framer's stop() does NOT fire onComplete, so a boolean could
@@ -1510,7 +1506,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     return stored ? stored === 'true' : true;
   });
 
-  // Active mode name (shown as a badge near the Modes button)
+  // Active mode name. (A mode/sources chip rendered here briefly on
+  // 2026-07-31 and was removed on user feedback — the zero-sources signal
+  // lives in Settings' per-file index badges and the [V3] attachedFiles log
+  // field instead.)
   const [activeModeLabel, setActiveModeLabel] = useState<string | null>(null);
   const [llmProviderLabel, setLlmProviderLabel] = useState<string>('unknown');
   const [llmPrivacyLabel, setLlmPrivacyLabel] = useState<string | null>(null);
@@ -1537,6 +1536,18 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     const unsub = window.electronAPI?.onModeChanged?.(
       (data: { id: string | null; name: string | null }) => {
         setActiveModeLabel(data.name);
+        // Defect G (2026-08-01): a mode switch must tear down in-flight chat
+        // UI state, not just relabel the badge — otherwise an answer planned
+        // under the old mode keeps its placeholder alive and lands visually
+        // as the NEW mode's answer. cancelActiveChatStream stops the active
+        // stream (main-side gemini-chat-stream-stop), finalizes any partial
+        // text, and drops a tokenless placeholder; committed history rows are
+        // never touched. Referencing it inside this closure (not the deps
+        // array) is deliberate: it is declared later in the component, so the
+        // deps array would evaluate it in its temporal dead zone at first
+        // render, while this IPC callback only ever runs after mount. It is a
+        // stable useCallback, so no re-subscription is needed.
+        cancelActiveChatStream();
       },
     );
     return () => unsub?.();
@@ -1696,7 +1707,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px] whitespace-pre-wrap" {...props} />
         ),
         strong: ({ node, ...props }: any) => (
-          <strong className="font-bold opacity-100 overlay-text-strong" {...props} />
+          <strong className="font-semibold overlay-hotword" {...props} />
         ),
         em: ({ node, ...props }: any) => (
           <em className="italic opacity-90 overlay-text-secondary" {...props} />
@@ -1797,10 +1808,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         ),
       },
       whatToAnswerText: {
-        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px]" {...props} />,
+        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px] whitespace-pre-wrap" {...props} />,
         strong: ({ node, ...props }: any) => (
           <strong
-            className="font-bold opacity-100 overlay-text-strong"
+            className="font-semibold overlay-hotword"
             {...props}
           />
         ),
@@ -1819,7 +1830,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         li: ({ node, ...props }: any) => <li className="pl-1 mb-[2.5px] last:mb-0 leading-[1.45] text-[14px]" {...props} />,
       },
       recapText: {
-        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px]" {...props} />,
+        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px] whitespace-pre-wrap" {...props} />,
         strong: ({ node, ...props }: any) => (
           <strong
             className="font-bold opacity-100 overlay-text-strong"
@@ -1830,7 +1841,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         li: ({ node, ...props }: any) => <li className="pl-1 mb-[2.5px] last:mb-0 leading-[1.45] text-[14px]" {...props} />,
       },
       followUpQuestionsText: {
-        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px]" {...props} />,
+        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px] whitespace-pre-wrap" {...props} />,
         strong: ({ node, ...props }: any) => (
           <strong
             className="font-bold opacity-100 overlay-text-strong"
@@ -1842,10 +1853,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         li: ({ node, ...props }: any) => <li className="pl-1 mb-[2.5px] last:mb-0 leading-[1.45] text-[14px]" {...props} />,
       },
       shortenText: {
-        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px]" {...props} />,
+        p: ({ node, ...props }: any) => <p className="mb-[2.5px] last:mb-0 leading-[1.45] text-[14px] whitespace-pre-wrap" {...props} />,
         strong: ({ node, ...props }: any) => (
           <strong
-            className="font-bold opacity-100 overlay-text-strong"
+            className="font-semibold overlay-hotword"
             {...props}
           />
         ),
@@ -1857,39 +1868,40 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   );
 
   // ── Code-expansion spring ────────────────────────────────────────────────
-  // Architecture: the OS window is a FIXED WIDTH (780) for its whole lifetime;
-  // only the CSS panel animates 600↔780, centered inside it. So width motion is
-  // PURELY renderer-side — there is no per-frame native width setBounds and the
-  // window X origin never moves (TopPill stays pixel-stable, no blur re-raster).
+  // Architecture: the OS window is a FIXED WIDTH (732 = SHELL_WIDTH_EXPANDED)
+  // for its whole visible lifetime; only the CSS panel animates 600↔732,
+  // CENTERED (mx-auto) inside it. Width motion is PURELY renderer-side — no
+  // width setBounds ever, so the window's X origin never moves, the panel's
+  // center is pixel-stable (symmetric growth), and the pill aux window
+  // (centered over this window by the main process) is pixel-STATIONARY.
+  // The TopPill and resize toggle live in their own aux BrowserWindows
+  // (OverlayAuxWindows.tsx); the toggle rides the panel's live top-right
+  // corner via the sendOverlayToggleAnchor stream below.
+  //
+  // The collapsed state leaves 66px transparent margins each side INSIDE this
+  // window; they are click-through via the hover hit-test effect below
+  // (setOverlayHoverInteractive), so they don't swallow clicks meant for apps
+  // beneath — while the painted panel is ALWAYS interactive (drag-safe).
   //
   // `shellWidth` is a MotionValue driven by OVERLAY_RESIZE_SPRING and bound
   // directly to the panel's CSS `width`. Content reflows to the real panel width
   // on every frame (correct at every in-between width — no clip/scale/transform).
-  // Only HEIGHT flows to the OS, via the ResizeObserver / reportShellSize (and a
-  // rate-limited channel during the tween); reportShellSize reads shellWidth.get()
-  // so the height it reports always matches the panel's current width.
+  // Only HEIGHT flows to the OS, via the ResizeObserver / reportShellSize (and
+  // a rate-limited channel during the tween).
   const SHELL_WIDTH_COLLAPSED = 600;
-  // The EXPANDED panel is intentionally NARROWER than the OS window (732 < 780).
-  // The window is fixed at 780 (OVERLAY_WINDOW_WIDTH below); decoupling the panel
-  // from it leaves a permanent ~24px gutter on each side even when expanded, which
-  // is the room the floating resize toggle needs to keep its corner gap in the
-  // expanded state (when the panel filled the window edge-to-edge there was no
-  // gutter, so the button was forced inward over the panel — the reported bug).
   const SHELL_WIDTH_EXPANDED = 732;
-  // The OS overlay window is a FIXED WIDTH for its entire visible lifetime. The
-  // window is created/shown at this width and never width-resized; the CSS panel
-  // animates 600↔732 centered inside it (mx-auto). This MUST match
-  // WindowHelper.OVERLAY_DEFAULT_WIDTH. Keeping the window width fixed means its
-  // X origin never moves, so the TopPill is pixel-stable and there is zero
-  // per-frame transparent-window re-raster. It is INTENTIONALLY wider than
-  // SHELL_WIDTH_EXPANDED so a side gutter always exists for the resize toggle.
-  const OVERLAY_WINDOW_WIDTH = 780;
+  // The OS overlay window's FIXED width. MUST equal
+  // WindowHelper.OVERLAY_DEFAULT_WIDTH (the window's birth width — the
+  // startup-slide invariant) and SHELL_WIDTH_EXPANDED (the panel fills the
+  // window edge-to-edge when expanded; the old 780 gutter existed only for
+  // the resize toggle, which now has its own aux window).
+  const OVERLAY_WINDOW_WIDTH = SHELL_WIDTH_EXPANDED;
   const shellWidth = useMotionValue(SHELL_WIDTH_COLLAPSED);
   // Vertical budget cap for the chat scroll area. Default Infinity = "not yet
   // measured / unbounded", so the width-derived aesthetic max applies until we
   // know the display height. measureVerticalCap (below) sets the real value:
   // floor(workArea.height*0.9) - chrome, mirroring the main-process clamp in
-  // WindowHelper.setOverlayDimensionsCentered. This keeps total content height
+  // WindowHelper.setOverlayDimensionsAnchored. This keeps total content height
   // ≤ the budget the OS window will be granted, so the footer (model selector /
   // settings / send) can never be cropped below the clamped window edge.
   const verticalCap = useMotionValue(Infinity);
@@ -1911,57 +1923,13 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       cap,
     ),
   );
-  // The floating resize toggle rides the panel's top-right CORNER along that
-  // corner's 45° bisector, with a small gap from the body when there's room. Its
-  // center is offset from the corner point by the SAME distance `d` on BOTH axes,
-  // which is what keeps it exactly on the 45° diagonal in every state (an earlier
-  // version clamped only the horizontal when expanded → unequal offsets → off the
-  // diagonal, the reported bug).
-  //
-  // Corner point in viewport coords:
-  //   • x: the panel is centered in the fixed-width OVERLAY_WINDOW_WIDTH window,
-  //     so its right edge sits M = (OVERLAY_WINDOW_WIDTH - shellWidth) / 2 px from
-  //     the window right (M = 90 collapsed → 0 expanded). Off the LIVE shellWidth,
-  //     so the button follows the corner every spring frame.
-  //   • y: the panel's measured top edge (panelTop, via measureButtonTop()).
-  //
-  // `d` = signed diagonal offset of the button CENTER from the corner, measured
-  // outward (toward the window's top-right corner = up-and-right):
-  //   • Desired: +GAP, so the button sits GAP px outside the corner in the gutter
-  //     — the space between body and button the user asked for.
-  //   • Constraint: the button must stay on-screen. The outward room to the right
-  //     is M (the gutter width); going further clips past the window edge. So we
-  //     cap d at (M - BTN/2 - EDGE_MARGIN). When expanded M→0 this cap is
-  //     NEGATIVE, so d flips negative and the button tucks INWARD along the SAME
-  //     diagonal (equal on both axes) — still on the 45° line, just inside the
-  //     corner instead of outside it.
-  // center-x from window right = M - d  → right = (M - d) - BTN/2
-  // center-y from window top   = panelTop - d → top = (panelTop - d) - BTN/2
-  const RESIZE_BTN_SIZE = 28; // matches ResizeToggle's w-[28px]
-  const RESIZE_BTN_DIAGONAL_GAP = 8; // outward gap from the corner when there's room
-  const RESIZE_BTN_EDGE_MARGIN = 2; // keep this much of the button on-screen when expanded
-  // Diagonal offset `d`, shared by both axes so the button is always on the 45°
-  // bisector. Capped by the available gutter so it never clips off the window.
-  const resizeBtnDiagonalOffset = useTransform(shellWidth, (w) => {
-    const m = (OVERLAY_WINDOW_WIDTH - w) / 2;
-    return Math.min(RESIZE_BTN_DIAGONAL_GAP, m - RESIZE_BTN_SIZE / 2 - RESIZE_BTN_EDGE_MARGIN);
-  });
-  const buttonRight = useTransform([shellWidth, resizeBtnDiagonalOffset], ([w, d]: number[]) =>
-    (OVERLAY_WINDOW_WIDTH - w) / 2 - d - RESIZE_BTN_SIZE / 2,
-  );
-  // Vertical anchor. `panelTopMV` holds the panel card's measured top edge
-  // (viewport-relative), set by measureButtonTop(). The button is position:fixed,
-  // but the panel card is NOT at the window top — it sits below the TopPill + 8px
-  // gap (plus any status pills / banners) — so this offset is dynamic and measured
-  // from shellRef. The panel's TOP does not move during a width animation (only
-  // its width does), so refreshing on layout change — not per frame — is enough.
-  // Initial guess covers TopPill(~36) + gap(8). buttonTop applies the SAME
-  // diagonal offset `d` as buttonRight (subtracted, since up = toward the window
-  // top) so the button center stays on the corner's 45° bisector in every state.
-  const panelTopMV = useMotionValue(44);
-  const buttonTop = useTransform([panelTopMV, resizeBtnDiagonalOffset], ([top, d]: number[]) =>
-    top - d - RESIZE_BTN_SIZE / 2,
-  );
+  // NOTE: the resize toggle and the TopPill no longer render in this window at
+  // all — each lives in its OWN tiny BrowserWindow (see
+  // WindowHelper.createOverlayAuxWindows + OverlayAuxWindows.tsx), positioned
+  // by the main process around this window's bounds. This window contains
+  // ONLY the shell card, so its rectangle has no transparent-but-interactive
+  // region. State flows to them via the sendOverlayUiState broadcast below;
+  // their actions come back via onOverlayUiAction.
 
   // isExpanded mirror for closures inside refs/observers that must not
   // re-bind on every toggle.
@@ -2073,6 +2041,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     kind: 'screen-recording-permission' | 'audio-capture-failure';
     message: string;
     channel?: 'system' | 'mic';
+    // i18n key for the banner heading, produced by main.ts `permissionTitleKey`
+    // and shipped over IPC as a KEY rather than a rendered string so titles stay
+    // localisable. Absent for emitters that predate it and for the in-app TCC
+    // repair result, which is constructed locally below.
+    titleKey?: string;
   };
   const [systemAudioWarning, setSystemAudioWarning] = useState<SystemAudioWarning | null>(null);
   // UX2: in-flight guard for the "Repair Permissions" button so a double-click
@@ -2084,12 +2057,19 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // process, so a real relaunch is the only reliable fix once the user has
   // granted permission in System Settings but still sees this banner.
   const [appRestarting, setAppRestarting] = useState(false);
+  // Which settings pane the user has already been sent to, keyed by the warning
+  // that sent them. The banner shows exactly ONE action plus close, so a
+  // permission warning surfaces "Open ... Settings" first and only becomes
+  // "Restart Now" once the user has actually visited the pane — macOS does not
+  // apply a fresh grant until the app relaunches, but a Restart button offered
+  // before the grant exists is an action that cannot work yet.
+  const [permissionPaneVisited, setPermissionPaneVisited] = useState<string | null>(null);
   useEffect(() => {
-    const unsub = window.electronAPI?.onSystemAudioPermissionDenied?.((message: string) => {
+    const unsub = window.electronAPI?.onSystemAudioPermissionDenied?.((message: string, titleKey?: string) => {
       // screen-recording-permission is implicitly system-channel (it's the
       // Screen Recording TCC pane). Set channel for consistency so the
       // button-resolution logic has a single source of truth.
-      setSystemAudioWarning({ kind: 'screen-recording-permission', message, channel: 'system' });
+      setSystemAudioWarning({ kind: 'screen-recording-permission', message, channel: 'system', titleKey });
       setIsExpanded(true); // Force overlay open so user sees the warning
     });
     return () => unsub?.();
@@ -2114,6 +2094,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           kind: 'audio-capture-failure',
           message: payload.message,
           channel: payload.channel,
+          titleKey: payload.titleKey,
         });
         setIsExpanded(true);
       }
@@ -2178,8 +2159,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   }, []);
 
   // This is called by every channel that ever sets the native window height
-  // directly (this function, resizeOverlayWindowCentered's width-transition
-  // callers, and the streaming-height buffer below via resizeOverlayWindowCentered
+  // directly (this function, resizeOverlayWindow's width-transition
+  // callers, and the streaming-height buffer below via resizeOverlayWindow
   // itself is a pure sender — this one carries the side effect) to keep
   // streamingHeightCommittedRef in sync with whatever the OS window's real
   // height now is. Without this, whichever channel last won would leave that
@@ -2193,11 +2174,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     streamingHeightCommittedRef.current = height;
   }, []);
 
-  // Single canonical size-reporter. Width is ALWAYS the fixed OVERLAY_WINDOW_WIDTH
-  // (the OS window never width-resizes — the CSS panel animates inside it), so
-  // this is effectively a height-only reporter; height is from the
-  // ResizeObserver-measured content rect. Centered IPC keeps the
-  // TopPill's horizontal center invariant across resizes. Also the channel
+  // Single canonical size-reporter. Width is ALWAYS the fixed
+  // OVERLAY_WINDOW_WIDTH (the OS window never width-resizes — the CSS panel
+  // animates inside it), so this is effectively a height-only reporter;
+  // height is from the ResizeObserver-measured content rect. Also the channel
   // that settles the streaming-height buffer back to the exact final size
   // once a stream ends (see the ResizeObserver call site below: once
   // streamingMsgIdRef.current goes null, the next observer fire takes this
@@ -2228,12 +2208,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // clock — the startup shake. Layout height is immune to descendant
     // transforms, so genuine content growth still flows through while the
     // entry flourish stays purely compositor-side.
-    // The OS window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 780) and never
-    // width-resizes — ALWAYS report that fixed width, never the live in-between
-    // CSS shell width. This makes setOverlayDimensionsCentered see widthDelta 0
-    // on every call, so the window's X origin never moves (no sideways jump) and
-    // the centered setBounds becomes a pure height-only, top-anchored resize.
-    // Height is content-driven and keeps flowing through this same call.
+    // The OS window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 732) and never
+    // width-resizes — ALWAYS report that fixed width, never the live
+    // in-between CSS shell width. setOverlayDimensionsAnchored therefore sees
+    // widthDelta 0 on every call: a pure height-only, top-anchored resize.
     const width = OVERLAY_WINDOW_WIDTH;
     const height = contentRef.current.offsetHeight;
     if (process.env.NODE_ENV === 'development') {
@@ -2293,27 +2271,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     verticalCap.set(nextCap);
   }, [attachedContext.length, verticalCap]);
 
-  // Measure the panel card's top edge (viewport-relative) into panelTopMV so the
-  // floating resize toggle can ride the panel's TOP-RIGHT CORNER, not the window
-  // top. The panel sits below the TopPill + 8px gap (and any status pills /
-  // warning banners that push it further down), so this offset is dynamic. We read
-  // shellRef (the rounded panel card itself), not contentRef (the whole stack
-  // including the TopPill). We store the RAW top edge here; buttonTop applies the
-  // diagonal offset + BTN/2 centering. getBoundingClientRect().top is
-  // viewport-relative, which is what position:fixed `top` wants. The panel's TOP
-  // does not move during a width animation (only its width does), so measuring on
-  // layout change — not per frame — is correct and cheap.
-  const measureButtonTop = useCallback(() => {
-    const shellEl = shellRef.current;
-    if (!shellEl) return;
-    const top = shellEl.getBoundingClientRect().top;
-    if (top > 0) panelTopMV.set(Math.round(top));
-  }, [panelTopMV]);
-
   // NOTE: the old per-frame "chase" subscriber that pushed the live shell width
-  // to setBounds every frame is GONE. The OS window is a fixed width (780) for
+  // to setBounds every frame is GONE. The OS window is a fixed width (732) for
   // its whole lifetime, so there is nothing to chase — the panel animates
-  // 600↔780 purely renderer-side (CSS `width` bound to the shellWidth spring),
+  // 600↔732 purely renderer-side (CSS `width` bound to the shellWidth spring),
   // with no native width resize at all. Only HEIGHT flows to the OS, via
   // reportShellSize / the ResizeObserver.
 
@@ -2331,11 +2292,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         // the observer fires again and this self-converges in ≤2 frames; chrome
         // height is scroll-invariant, so there is no feedback loop.
         measureVerticalCap();
-        // Re-anchor the floating resize toggle: anything that changes content
-        // height above the panel (status pills, warning banners, an attached
-        // screenshot strip) shifts the panel's top edge, so the button's `top`
-        // must follow. Cheap rect read, not per width-frame.
-        measureButtonTop();
         // FLICKER GUARD: during the CSS width tween the panel width changes every
         // frame, which reflows content height every frame and fires this observer
         // ~60×; each reportShellSize() would do a native height setBounds, and
@@ -2374,7 +2330,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         rafDimUpdateRef.current = null;
       }
     };
-  }, [reportShellSize, measureVerticalCap, measureButtonTop]);
+  }, [reportShellSize, measureVerticalCap]);
 
   // attachedContext (screenshots add/remove) and initial-sizing safety:
   // both re-derive the vertical cap (a screenshot strip grows chrome) and
@@ -2383,54 +2339,48 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       measureVerticalCap();
-      measureButtonTop();
       reportShellSize();
     });
     return () => cancelAnimationFrame(id);
-  }, [attachedContext, reportShellSize, measureVerticalCap, measureButtonTop]);
+  }, [attachedContext, reportShellSize, measureVerticalCap]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
       measureVerticalCap();
-      measureButtonTop();
       reportShellSize();
     }, 600);
     return () => clearTimeout(timer);
-  }, [reportShellSize, measureVerticalCap, measureButtonTop]);
+  }, [reportShellSize, measureVerticalCap]);
 
-  // ── Code-expansion (renderer-only width spring, fixed-width window) ──────────
-  // THE FIX: the OS window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 780) for its
-  // entire visible lifetime, and the panel is centered (mx-auto) inside it. There
-  // is NO width setBounds during the interaction at all. The expand/contract
-  // travel is a renderer-only CSS `width` animation: the `shellWidth` spring is
-  // bound to the panel's `width` style, so the content reflows (text re-wrap +
-  // code re-layout) to the real panel width on every frame and is correct at
-  // every in-between width — no clipping, no phantom layout width, no transform
-  // distortion. Per-frame reflow cost is held down by `contain: layout style` on
-  // the shell (scopes the reflow) + memoized syntax highlighting (a width change
-  // re-wraps without re-tokenizing).
+  // ── Code-expansion (renderer-only width spring, fixed-width window) ─────────
+  // The expand/contract travel is a renderer-only CSS `width` animation: the
+  // `shellWidth` spring is bound to the panel's `width` style, so the content
+  // reflows (text re-wrap + code re-layout) to the real panel width on every
+  // frame and is correct at every in-between width — no clipping, no phantom
+  // layout width, no transform distortion. Per-frame reflow cost is held down
+  // by `contain: layout style` on the shell (scopes the reflow) + memoized
+  // syntax highlighting (a width change re-wraps without re-tokenizing).
   //
-  // Why: the previous two attempts shifted the window's X origin during the
-  // animation (to keep the panel centered as the window width changed). But
-  // Chromium does NOT synchronize a programmatic setBounds with the renderer's
-  // paint on macOS, so for one frame the old framebuffer (painted at the old
-  // origin) was shown at the new shifted origin → the TopPill snapped sideways,
-  // and repeating that per frame WAS the flicker. With a fixed window width the
-  // X origin never moves, so:
-  //   • TopPill (centered in the fixed window) is pixel-stable — zero jump.
-  //   • No per-frame width setBounds → no transparent-blur re-raster — zero flicker.
+  // The OS window is a FIXED WIDTH — there is NO width setBounds during the
+  // interaction at all. Why: Chromium does NOT synchronize a programmatic
+  // setBounds with the renderer's paint on macOS, so a setBounds that moves
+  // painted pixels shows the old framebuffer at the new origin for one frame
+  // — repeating that per frame WAS the historical flicker, and a boundary
+  // resize of a CENTERED panel flashes the same way once. A fixed window
+  // sidesteps the whole class: the panel grows symmetrically in CSS around a
+  // pixel-stable center.
   //
-  // Only HEIGHT still flows to the OS (content/streaming growth), via a
+  // HEIGHT flows to the OS continuously (content/streaming growth), via a
   // height-only, top-anchored setBounds — which does not move X. During the CSS
   // width animation the height reflows every frame, so the ResizeObserver's own
   // reporting is SUPPRESSED (heightReportSuppressedUntilRef) and the animation
   // instead drives height itself, rate-limited to ~30fps (see startTransition),
   // with a final authoritative settle at onComplete.
-  const resizeOverlayWindowCentered = useCallback(
+  const resizeOverlayWindow = useCallback(
     (height: number) => {
       if (height <= 0) return;
       // Width is ALWAYS the fixed window width → widthDelta 0 in the main
-      // process → X never moves; this collapses to a pure height-only resize.
+      // process; this collapses to a pure height-only resize.
       const api = window.electronAPI as any;
       if (api?.updateContentDimensionsCentered) {
         api.updateContentDimensionsCentered({ width: OVERLAY_WINDOW_WIDTH, height });
@@ -2466,7 +2416,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         streamingHeightStreamIdRef.current = currentStreamId;
         const committed = targetHeight + STREAMING_HEIGHT_GROW_BUFFER_PX;
         streamingHeightCommittedRef.current = committed;
-        resizeOverlayWindowCentered(committed);
+        resizeOverlayWindow(committed);
         return;
       }
 
@@ -2484,9 +2434,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // height.
       const committed = targetHeight + STREAMING_HEIGHT_GROW_BUFFER_PX;
       streamingHeightCommittedRef.current = committed;
-      resizeOverlayWindowCentered(committed);
+      resizeOverlayWindow(committed);
     },
-    [resizeOverlayWindowCentered],
+    [resizeOverlayWindow],
   );
   // Keep the ResizeObserver's indirection ref current (see
   // driveStreamingHeightRef's declaration above for why this can't just be a
@@ -2587,7 +2537,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         reserveScrollHeadroomIfNeeded();
         const h = contentRef.current?.offsetHeight ?? 0;
         if (h > 0) {
-          resizeOverlayWindowCentered(h);
+          resizeOverlayWindow(h);
           syncStreamingHeightBaseline(h);
         }
         return;
@@ -2625,8 +2575,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       let lastReportedHeight = -1;
       const HEIGHT_REPORT_INTERVAL_MS = 33; // ~30fps
 
-      // WIDTH SPRING on the renderer clock (600↔780 inside the fixed window). Why
-      // a spring instead of the old duration+bezier tween:
+      // WIDTH SPRING on the renderer clock (600↔732 inside the fixed window).
+      // Why a spring instead of the old duration+bezier tween:
       //
       //   The scroll scanner re-fires startTransition whenever a code block
       //   crosses the viewport edge during a scroll. A duration+bezier RESTARTS
@@ -2655,7 +2605,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           if (h <= 0 || h === lastReportedHeight) return;
           lastHeightReportAt = now;
           lastReportedHeight = h;
-          resizeOverlayWindowCentered(h);
+          resizeOverlayWindow(h);
           syncStreamingHeightBaseline(h);
         },
         onComplete: () => {
@@ -2668,7 +2618,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           // scroll max) has fully settled — guarantees the final frame is exact
           // even if the last rate-limited sample landed a few px short.
           const settledHeight = contentRef.current?.offsetHeight ?? 0;
-          resizeOverlayWindowCentered(settledHeight);
+          resizeOverlayWindow(settledHeight);
           syncStreamingHeightBaseline(settledHeight);
         },
       });
@@ -2676,7 +2626,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     [
       shellWidth,
       SHELL_WIDTH_EXPANDED,
-      resizeOverlayWindowCentered,
+      resizeOverlayWindow,
       syncStreamingHeightBaseline,
       pinScrollBottomIfNeeded,
       reserveScrollHeadroomIfNeeded,
@@ -2696,6 +2646,101 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     manualWidthOverrideRef.current = target;
     startTransition(target);
   }, [shellWidth, startTransition, SHELL_WIDTH_COLLAPSED, SHELL_WIDTH_EXPANDED]);
+
+  // ── Aux-window bridge ─────────────────────────────────────────────────────
+  // The TopPill and resize toggle live in their own BrowserWindows. Broadcast
+  // the UI state they render from; execute the actions they send back.
+  useEffect(() => {
+    window.electronAPI
+      ?.sendOverlayUiState?.({
+        expanded: isExpanded,
+        shellWide: isShellWide,
+        hasContent: messages.length > 0,
+        overlayOpacity,
+        themeMode: isLightTheme ? 'light' : 'dark',
+        interfaceTheme: isGlassTheme ? 'liquid-glass' : isModernTheme ? 'modern' : 'default',
+      })
+      .catch(() => {});
+  }, [
+    isExpanded,
+    isShellWide,
+    messages.length,
+    overlayOpacity,
+    isLightTheme,
+    isGlassTheme,
+    isModernTheme,
+  ]);
+
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onOverlayUiAction?.((action) => {
+      switch (action?.type) {
+        case 'toggle-width':
+          handleManualResizeToggle();
+          break;
+        case 'toggle-expand':
+          setIsExpanded((prev) => !prev);
+          break;
+        case 'end-meeting':
+          if (onEndMeeting) onEndMeeting();
+          else window.electronAPI.quitApp();
+          break;
+      }
+    });
+    return () => unsubscribe?.();
+  }, [handleManualResizeToggle, onEndMeeting]);
+
+  // Stream the panel's LIVE right edge (px from the window's left edge) to the
+  // main process so the toggle aux window rides the panel's top-right corner
+  // through the width spring — the same corner-riding the old in-window
+  // MotionValue gave. The panel is centered in the fixed window, so
+  // right edge = (OVERLAY_WINDOW_WIDTH + shellWidth) / 2. MotionValue 'change'
+  // fires per spring frame AND on imperative .set()s (session reset, no-op
+  // snap, reduced-motion), so every path that moves the corner is covered;
+  // integer dedupe keeps the IPC rate at ~60 msgs for a 0.3s spring, and
+  // moving a 36px window is a compositor-only surface move (no re-raster).
+  useEffect(() => {
+    let lastSent = -1;
+    const send = (w: number) => {
+      const panelRight = Math.round((OVERLAY_WINDOW_WIDTH + w) / 2);
+      if (panelRight === lastSent) return;
+      lastSent = panelRight;
+      window.electronAPI?.sendOverlayToggleAnchor?.({ panelRight }).catch(() => {});
+    };
+    send(shellWidth.get());
+    const unsubscribe = shellWidth.on('change', send);
+    return () => unsubscribe();
+  }, [shellWidth, OVERLAY_WINDOW_WIDTH]);
+
+  // Hover hit-test → margins click-through. The fixed window is wider than
+  // the collapsed panel (66px transparent margin each side); while the
+  // pointer is over a margin the main process flips the window to
+  // setIgnoreMouseEvents(true, {forward:true}) so clicks land on the app
+  // beneath. forward:true keeps mousemove streaming even while ignored, so
+  // crossing back over the panel re-arms interactivity BEFORE a click can
+  // happen. The default (main-process side) is interactive — the panel and
+  // its drag regions are never gated. PAD inflates the panel rect slightly so
+  // fast pointer travel can't outrun the flip at the boundary.
+  useEffect(() => {
+    let interactive = true;
+    // Handshake reset: this effect only sends on boundary CROSSINGS, so the
+    // renderer's local flag and the main process's cached flag must start
+    // aligned. After a renderer reload (crash recovery) main may have a
+    // latched non-interactive state from the previous renderer — without this
+    // unconditional resync, an expanded panel (margin 0 → "inside" always
+    // true → no crossing ever) would stay click-through forever.
+    window.electronAPI?.setOverlayHoverInteractive?.(true).catch(() => {});
+    const PAD = 8;
+    const onMouseMove = (e: MouseEvent) => {
+      const margin = (OVERLAY_WINDOW_WIDTH - shellWidth.get()) / 2;
+      const inside =
+        e.clientX >= margin - PAD && e.clientX <= OVERLAY_WINDOW_WIDTH - margin + PAD;
+      if (inside === interactive) return;
+      interactive = inside;
+      window.electronAPI?.setOverlayHoverInteractive?.(inside).catch(() => {});
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    return () => window.removeEventListener('mousemove', onMouseMove);
+  }, [shellWidth, OVERLAY_WINDOW_WIDTH]);
 
   // Derive the resize-button icon state from the live shell width. Subscribing
   // to the motion value (rather than tracking each startTransition caller)
@@ -2808,67 +2853,63 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // rAF-coalesced scroll listener below (used today for checkCodeVisibility)
   // rather than adding a second `scroll` listener / rAF loop.
   //
-  // Order matters: the near-bottom re-arm check runs BEFORE the
-  // decreased-scrollTop interrupt check. A content-height shrink (e.g. a
-  // message removed, or finalize replacing streamed text) can make the
-  // browser clamp scrollTop downward on its own, which looks identical to a
-  // user scrolling up (delta < 0) — but those clamps always land AT the
-  // bottom, so checking distance-from-bottom first makes them self-healing
-  // instead of falsely arming suppression.
+  // Order matters, but NOT the way an earlier version of this comment
+  // claimed. The arm check (delta < 0) now runs FIRST, unconditionally on
+  // direction — a distance-gated re-arm-first ordering silently swallowed
+  // any real upward scroll that hadn't yet traveled past the re-arm
+  // tolerance, which is every scrollbar-thumb-drag under ~28px and, during
+  // active auto-follow (where the view sits within a few px of bottom by
+  // design), effectively the first several frames of ANY upward gesture on
+  // this path — a real bug, not a hypothetical: it made scrollbar-drag
+  // interrupts nearly impossible to trigger, and is one of the few
+  // interrupt channels left when OS-level click-through (stealth mode) is
+  // active and native `wheel` events never reach this window at all (see
+  // WindowHelper.syncOverlayInteractionPolicy — no per-element hover
+  // exception exists for the chat scroll container).
   //
-  // That same native clamp is also why this re-arm is gated OFF while a
-  // width/height transition is actively in flight (heightReportSuppressedUntilRef
-  // is the existing "spring is running" signal, set in startTransition). A
-  // transition growing clientHeight shrinks the max scrollable position
-  // (scrollHeight - clientHeight), and if the user's post-interrupt scrollTop
-  // is within that shrinking margin, the BROWSER forces it back toward the
-  // bottom on its own — no user input involved. Read purely by geometry, that
-  // native clamp is indistinguishable from "the user scrolled back down" and
-  // would silently clear a real interrupt within the same transition that
-  // triggered it. Verified live (see the code-block-transition repro during
-  // this fix): with this guard absent, a genuine wheel-armed interrupt got
-  // erased mid-transition even though pinScrollBottomIfNeeded itself never
-  // wrote a single frame. A deliberate user wheel-down tick still re-arms
-  // immediately regardless of an in-flight transition — see onWheel's
-  // deltaY>0 branch above, which is unambiguous because it can only
-  // originate from real input.
+  // This does NOT reopen the native-clamp false-positive the old ordering
+  // was defending against (a content-height SHRINK — e.g. finalize
+  // replacing streamed text, or a code block collapsing — can make the
+  // browser clamp scrollTop down on its own, which also reads as delta<0).
+  // Two things jointly rule that out:
+  //   1. `!isAutoScrollSuppressed()` already gates the arm branch. A shrink
+  //      that happens while ALREADY suppressed is a no-op here regardless of
+  //      ordering — suppression can't be armed twice.
+  //   2. A shrink while NOT yet suppressed always originates from a
+  //      `messages` state change (finalize/edit) or a layout change our own
+  //      effects observe synchronously in the same commit — the streaming
+  //      effect (when not suppressed) and pinScrollBottomIfNeeded (when
+  //      wasAtBottomRef is true) both re-pin scrollTop AND resync
+  //      lastScrollTopRef in that same synchronous pass, strictly before the
+  //      browser's own resulting `scroll` event can fire asynchronously and
+  //      reach this handler. By the time this handler runs, lastScrollTopRef
+  //      already reflects the corrected position, so the native clamp's own
+  //      delta reads as ~0, not negative.
+  // The arm/re-arm decision itself is a pure function (decideScrollInterrupt,
+  // src/lib/scrollInterruptDecision.mjs, table-tested) — this handler stays
+  // responsible only for gathering its inputs from the DOM/refs and applying
+  // the resulting side effects. That split exists because this exact
+  // branching was wrong three separate times across three separate commits
+  // (dead-zone ordering, then a wheel-nudge self-disarm), each caught only by
+  // live manual repro — see the pure function's own comments and its test
+  // file for the two regressions this now guards against.
   const handleScrollInterrupt = useCallback(() => {
-    if (!autoScroll) return;
     const container = scrollContainerRef.current;
     if (!container) return;
     const distanceFromBottom =
       container.scrollHeight - (container.scrollTop + container.clientHeight);
     const delta = container.scrollTop - lastScrollTopRef.current;
     lastScrollTopRef.current = container.scrollTop;
-
     const transitionInFlight = Date.now() < heightReportSuppressedUntilRef.current;
-    if (distanceFromBottom <= 28 && !transitionInFlight) {
-      // Looser tolerance than the 8px used for the sticky-bottom transition
-      // pin (wasAtBottomRef) — this is a manual re-arm, not a pixel-perfect
-      // "still at bottom" check. Lets a user who scrolled up, read, then
-      // scrolled back down themselves resume live-following without waiting
-      // for the next message.
-      autoScrollSuppressedForMsgIdRef.current = null;
-      setJumpToLatestVisible(false);
-      clearScrollHeadroom();
-      return;
-    }
 
-    // Only arm on a FRESH interrupt (not already suppressed for this stream).
-    // Without this guard, once reserveScrollHeadroomIfNeeded's spacer growth
-    // lags a frame behind an active clientHeight increase, the browser's own
-    // clamp nudges scrollTop down by a pixel or two — an entirely
-    // self-inflicted, native side effect, not user input — which this same
-    // delta<0 check would otherwise misread as a brand new interrupt and
-    // re-snapshot clientHeightAtInterruptRef to the (already-grown) CURRENT
-    // clientHeight every single frame. That perpetually resets the headroom
-    // baseline forward in lockstep with the growth it's supposed to be
-    // measuring against, so computed growth reads ~0 forever and the spacer
-    // never gets a chance to reserve anything — confirmed live via the
-    // wheel-only repro during this fix (clientHeightAtInterruptRef tracked
-    // current clientHeight frame-for-frame instead of staying pinned to the
-    // value at the moment of the real interrupt).
-    if (delta < 0 && !isAutoScrollSuppressed()) {
+    const decision = decideScrollInterrupt({
+      delta,
+      distanceFromBottom,
+      alreadySuppressed: isAutoScrollSuppressed(),
+      transitionInFlight,
+    });
+
+    if (decision === 'arm') {
       // User-initiated upward scroll (our own auto-scroll writes only ever
       // increase/hold scrollTop, see the streaming effect + pinScrollBottomIfNeeded).
       autoScrollSuppressedForMsgIdRef.current = streamingMsgIdRef.current;
@@ -2881,8 +2922,18 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // withheld — scrolling up in a finished, static conversation must not
       // surface a pill with no suppression behind it.
       setJumpToLatestVisible(streamingMsgIdRef.current !== null);
+      return;
     }
-  }, [autoScroll, setJumpToLatestVisible, clearScrollHeadroom, isAutoScrollSuppressed]);
+
+    if (decision === 're-arm') {
+      // Lets a user who scrolled up, read, then scrolled back down
+      // themselves resume live-following without waiting for the next
+      // message.
+      autoScrollSuppressedForMsgIdRef.current = null;
+      setJumpToLatestVisible(false);
+      clearScrollHeadroom();
+    }
+  }, [setJumpToLatestVisible, clearScrollHeadroom, isAutoScrollSuppressed]);
 
   // "Jump to latest" pill click handler — the ONE place `behavior: 'smooth'`
   // is used for this scroll container. The per-frame streaming chase (step 4)
@@ -2923,6 +2974,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
+    // Reseed from the real DOM on every (re)mount — this effect reruns
+    // whenever scrollContainerMounted flips (container unmounts on an empty
+    // chat, remounts on the next message), and a stale value left over from
+    // a prior mount could otherwise read as a spurious delta on the first
+    // handleScrollInterrupt call after remount.
+    lastScrollTopRef.current = container.scrollTop;
     let rafId: number | null = null;
     const onScroll = () => {
       if (rafId !== null) return;
@@ -2949,7 +3006,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // remains a secondary signal for input that doesn't fire wheel events
     // (e.g. dragging the scrollbar thumb directly).
     const onWheel = (e: WheelEvent) => {
-      if (!autoScroll) return;
       if (e.deltaY < 0) {
         // Upward tick — interrupt, no threshold. Mirrors handleScrollInterrupt's
         // direction check but reads raw input directly (see the effect-level
@@ -3003,7 +3059,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     scrollContainerMounted,
     checkCodeVisibility,
     handleScrollInterrupt,
-    autoScroll,
     setJumpToLatestVisible,
     clearScrollHeadroom,
     isAutoScrollSuppressed,
@@ -3137,8 +3192,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // and that's fine). 400ms is kept as a small grace period so any
       // user-initiated focus shifts in the same tick settle before the OS
       // window goes offscreen, avoiding a one-frame click-through glitch
-      // on fast Cmd+B taps.
-      setTimeout(() => window.electronAPI.hideWindow(), 400);
+      // on fast Cmd+B taps. The timer MUST be cancelled if we re-expand (or
+      // unmount) within the grace period — a stale timer firing after a fast
+      // collapse→re-expand hides BOTH windows out from under the user.
+      const hideTimer = setTimeout(() => window.electronAPI.hideWindow(), 400);
+      return () => clearTimeout(hideTimer);
     }
   }, [isExpanded]);
 
@@ -3236,9 +3294,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // Release any height-report suppression from an in-flight tween.
       heightReportSuppressedUntilRef.current = 0;
       // Imperative .set() (not animate) — no transient frame. The OS window
-      // stays fixed at OVERLAY_WINDOW_WIDTH, so snapping the shell width back to
-      // collapsed is a renderer-only width reset (content reflows once for the
-      // fresh meeting) with no native resize and no sideways motion.
+      // stays fixed at OVERLAY_WINDOW_WIDTH, so snapping the shell width back
+      // to collapsed is a renderer-only width reset (content reflows once for
+      // the fresh meeting) with no native resize and no sideways motion. The
+      // toggle aux window follows via the shellWidth 'change' anchor stream.
       shellWidth.set(SHELL_WIDTH_COLLAPSED);
       setInputValue('');
       setAttachedContext([]);
@@ -3584,8 +3643,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     }
     // marked.parse is sync and fast (<1ms for typical LLM chunks).
     // DOMPurify strips any script/event-handler injection.
-    const rawHtml = marked.parse(revealed, { async: false }) as string;
-    node.innerHTML = DOMPurify.sanitize(rawHtml);
+    // Teleprompter gist: a trailing [[GIST]] line (or a partial marker still
+    // streaming in) is split off the spoken body and painted as a bottom
+    // summary chip instead of literal text.
+    const { body: revealedBody, gist: revealedGist } = splitGistLineStreaming(revealed);
+    const rawHtml = collapseBlockGaps(marked.parse(revealedBody, { async: false }) as string);
+    const gistHtml = revealedGist
+      ? `<div class="overlay-gist-chip">${revealedGist
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`
+      : '';
+    node.innerHTML = DOMPurify.sanitize(rawHtml + gistHtml);
   }, []);
 
   // Mode-aware paint sink's "code" branch: same cursor-over-accumulated-text
@@ -4129,6 +4196,23 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     requestStartTimeRef.current = null;
     setIsProcessing(false);
     flushToken();
+    // Defect G (2026-08-01): flushToken() finalizes a placeholder that already
+    // streamed text (partial answer stays visible as committed history), but a
+    // TOKENLESS placeholder takes flushToken's early-return and keeps its refs
+    // wired. The main process now suppresses done/error for a cancelled or
+    // mode-stale stream (registry invalidation + pre-emit identity check), so
+    // nothing would ever finalize that row — it would spin forever. Drop it
+    // here. Committed rows are untouched: the filter only matches the exact
+    // in-flight row (by id) that is still streaming with no text.
+    const danglingId = streamingMsgIdRef.current;
+    if (danglingId !== null && streamingTextRef.current === '') {
+      streamingMsgIdRef.current = null;
+      streamingIntentRef.current = null;
+      streamingRenderModeRef.current = 'imperative';
+      if (streamingNodeRef.current) streamingNodeRef.current.innerHTML = '';
+      streamingNodeRef.current = null;
+      setMessages((prev) => prev.filter((m) => !(m.id === danglingId && m.isStreaming && !m.text)));
+    }
     tokenBufRef.current.intent = '';
     tokenBufRef.current.text = '';
     if (tokenBufRef.current.raf !== null) {
@@ -4465,9 +4549,21 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         );
         liveAnswerGenIdRef.current = decision.activeId;
         if (!decision.accept) return;
+        // Staleness bound (2026-07-31): generation supersession is WTA-relative
+        // only, so a slow generation stays "current" through manual turns and
+        // mode switches — a minutes-old answer then appears with nothing saying
+        // which question it answers (the live "late CGPA answer"). Old finals
+        // are labelled with their question instead of dropped: the answer may
+        // still be wanted, but it must not read as a reply to the latest turn.
+        const emittedAt = (data as { emittedAt?: number }).emittedAt;
+        const STALE_ANSWER_MS = 30_000;
+        const isStale = typeof emittedAt === 'number' && Date.now() - emittedAt > STALE_ANSWER_MS;
+        const answerText = isStale && data.question
+          ? `(Late answer to: "${data.question}")\n\n${data.answer}`
+          : data.answer;
         setIsProcessing(false);
         pinAnswerPanel();
-        finalizeStreamingByIntent('what_to_answer', data.answer);
+        finalizeStreamingByIntent('what_to_answer', answerText);
       }),
     );
 
@@ -5329,7 +5425,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     // Stream Error
     cleanups.push(
-      window.electronAPI.onGeminiStreamError((error) => {
+      window.electronAPI.onGeminiStreamError((error, meta?: { streamId?: number | null; source?: string }) => {
+        // Guard (2026-07-31): a tagged error belonging to another stream must
+        // not tear down the one we're rendering. A phone-mirror failure carries
+        // source:'phone-mirror' and no streamId; a desktop failure carries the
+        // originating streamId — drop it unless it matches the adopted stream.
+        // Untagged errors keep the legacy behavior exactly.
+        if (meta?.source === 'phone-mirror') return;
+        if (typeof meta?.streamId === 'number'
+          && chatStreamIdRef.current !== null
+          && meta.streamId !== chatStreamIdRef.current) return;
         flushToken();
         setIsProcessing(false);
         requestStartTimeRef.current = null; // Clear timer on error
@@ -5999,7 +6104,7 @@ Provide only the answer, nothing else.`;
           return (
             <div
               key="streaming-precode"
-              className="w-full ai-response-card my-2.5 min-h-[24px] transition-opacity duration-200 markdown-content whitespace-pre-wrap text-[14px] leading-relaxed"
+              className="w-full ai-response-card my-2.5 min-h-[24px] transition-opacity duration-200 markdown-content whitespace-pre-wrap text-[14px] leading-relaxed natively-streaming-answer"
             >
               {isThinking ? (
                 <div className="flex items-center min-h-[24px] py-0.5">
@@ -6031,7 +6136,7 @@ Provide only the answer, nothing else.`;
             <div
               key="streaming"
               ref={(el) => registerStreamingNode(msg.id, el)}
-              className="w-full ai-response-card my-2.5 min-h-[24px] transition-opacity duration-200 markdown-content whitespace-pre-wrap text-[14px] leading-relaxed"
+              className="w-full ai-response-card my-2.5 min-h-[24px] transition-opacity duration-200 markdown-content whitespace-pre-wrap text-[14px] leading-relaxed natively-streaming-answer"
             >
               {/*
                * Blinking-dot indicator INSIDE the streaming bubble. Renders
@@ -6222,13 +6327,20 @@ Provide only the answer, nothing else.`;
         );
       }
 
+      // Teleprompter gist: a trailing [[GIST]] line is display metadata, not
+      // spoken text — split it off the finalized answer and render it as a
+      // bottom summary chip on the spoken-answer surfaces below. Copy actions
+      // get the body without the marker.
+      const { body: gistBody, gist: gistLine } = splitGistLine(msg.text);
+      const gistChip = gistLine ? <div className="overlay-gist-chip">{gistLine}</div> : null;
+
       // Custom Styled Labels (Shorten, Recap, Follow-up) - also use Markdown for content
       if (msg.intent === 'shorten') {
         return (
           <div className="w-full ai-response-card my-2.5 transition-opacity duration-200 relative group">
             <div className="absolute top-0 right-0 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none group-hover:pointer-events-auto">
               <CardCopyButton
-                text={msg.text}
+                text={gistBody}
                 onCopy={handleCopy}
                 isLightTheme={isLightTheme}
                 isModernTheme={isModernTheme}
@@ -6241,8 +6353,9 @@ Provide only the answer, nothing else.`;
                 rehypePlugins={REHYPE_PLUGINS}
                 components={mdComponents.shortenText}
               >
-                {msg.text}
+                {gistBody}
               </ReactMarkdown>
+              {gistChip}
             </div>
           </div>
         );
@@ -6253,7 +6366,7 @@ Provide only the answer, nothing else.`;
           <div className="w-full ai-response-card my-2.5 transition-opacity duration-200 relative group">
             <div className="absolute top-0 right-0 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none group-hover:pointer-events-auto">
               <CardCopyButton
-                text={msg.text}
+                text={gistBody}
                 onCopy={handleCopy}
                 isLightTheme={isLightTheme}
                 isModernTheme={isModernTheme}
@@ -6266,8 +6379,9 @@ Provide only the answer, nothing else.`;
                 rehypePlugins={REHYPE_PLUGINS}
                 components={mdComponents.recapText}
               >
-                {msg.text}
+                {gistBody}
               </ReactMarkdown>
+              {gistChip}
             </div>
           </div>
         );
@@ -6299,14 +6413,15 @@ Provide only the answer, nothing else.`;
       }
 
       if (msg.intent === 'what_to_answer') {
-        // Split text by code blocks (Handle unclosed blocks at EOF)
-        const parts = msg.text.split(/(```[\s\S]*?(?:```|$))/g);
+        // Split text by code blocks (Handle unclosed blocks at EOF).
+        // gistBody (not msg.text): the [[GIST]] line renders as the chip below.
+        const parts = gistBody.split(/(```[\s\S]*?(?:```|$))/g);
 
         return (
           <div className="w-full ai-response-card my-2.5 transition-opacity duration-200 relative group">
             <div className="absolute top-0 right-0 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none group-hover:pointer-events-auto">
               <CardCopyButton
-                text={msg.text}
+                text={gistBody}
                 onCopy={handleCopy}
                 isLightTheme={isLightTheme}
                 isModernTheme={isModernTheme}
@@ -6366,6 +6481,7 @@ Provide only the answer, nothing else.`;
                   </div>
                 );
               })}
+              {gistChip}
             </div>
           </div>
         );
@@ -6377,7 +6493,7 @@ Provide only the answer, nothing else.`;
           <div className="w-full ai-response-card my-2.5 transition-opacity duration-200 relative group">
             <div className="absolute top-0 right-0 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none group-hover:pointer-events-auto">
               <CardCopyButton
-                text={msg.text}
+                text={gistBody}
                 onCopy={handleCopy}
                 isLightTheme={isLightTheme}
                 isModernTheme={isModernTheme}
@@ -6390,8 +6506,9 @@ Provide only the answer, nothing else.`;
                 rehypePlugins={REHYPE_PLUGINS}
                 components={mdComponents.standard}
               >
-                {msg.text}
+                {gistBody}
               </ReactMarkdown>
+              {gistChip}
             </div>
           </div>
         );
@@ -6715,7 +6832,12 @@ Provide only the answer, nothing else.`;
         e.preventDefault();
         handlers.toggleVisibility();
       } else if (isShortcutPressed(e, 'processScreenshots')) {
-        if (!isInput) {
+        // The bound accelerator carries a modifier (Cmd/Ctrl+Enter): it is the
+        // "What should I say?" trigger, never text entry, so the input-focus
+        // suppression must not swallow it. Without this, a press while the chat
+        // textarea holds focus does nothing at all — the textarea's own Enter
+        // handler claims it and no-ops on an empty input.
+        if (!isInput || e.metaKey || e.ctrlKey) {
           e.preventDefault();
           handlers.processScreenshots();
         }
@@ -7188,8 +7310,16 @@ Provide only the answer, nothing else.`;
     if (!window.electronAPI?.modelSelectorCloseIfOpen) return;
     const onMouseDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target?.closest?.('[data-model-selector-toggle="true"]')) return;
-      window.electronAPI.modelSelectorCloseIfOpen().catch(() => {});
+      if (!target?.closest?.('[data-model-selector-toggle="true"]')) {
+        window.electronAPI.modelSelectorCloseIfOpen().catch(() => {});
+      }
+      // Same treatment for the settings dropdown: any overlay-body mousedown
+      // that isn't on the settings toggle itself closes it (guarded so the
+      // toggle's own open/close logic doesn't race). Clicks OUTSIDE the
+      // overlay entirely are handled by the main-process click-catcher.
+      if (!target?.closest?.('[data-settings-toggle="true"]')) {
+        window.electronAPI?.dismissOverlayPopovers?.({ settings: true, model: false }).catch(() => {});
+      }
     };
     document.addEventListener('mousedown', onMouseDown, true); // capture phase
     return () => document.removeEventListener('mousedown', onMouseDown, true);
@@ -7336,27 +7466,16 @@ Provide only the answer, nothing else.`;
 
   return (
     <>
-    {/* Standalone resize toggle — fixed to the top-right corner of the Electron
-        window, completely outside the main panel body. Inherits screen-capture
-        protection from the BrowserWindow's setContentProtection. The hover
-        hit-test in the useEffect above includes this button's rect so hovering
-        it keeps the window interactive; stealth passthrough still wins when
-        undetectable mode is on (syncOverlayInteractionPolicy in WindowHelper
-        ORs the master passthrough flag). Only rendered once there's content. */}
-    {messages.length > 0 && (
-      <ResizeToggle
-        ref={resizeToggleRef}
-        expanded={isShellWide}
-        onToggle={handleManualResizeToggle}
-        appearance={appearance}
-        interfaceTheme={isGlassTheme ? 'liquid-glass' : isModernTheme ? 'modern' : 'default'}
-        rightOffset={buttonRight}
-        topOffset={buttonTop}
-      />
-    )}
+    {/* The resize toggle and the TopPill render in their OWN aux
+        BrowserWindows (OverlayAuxWindows.tsx), positioned by the main
+        process around this window. This window is exactly the shell card. */}
     <div
       ref={contentRef}
       data-interface-theme={isGlassTheme ? 'liquid-glass' : isModernTheme ? 'modern' : 'default'}
+      // CENTERED (mx-auto) in the fixed-width window: the window never
+      // width-resizes, so centering is stable — the panel's center (and the
+      // pill window centered over this window) never moves as the panel
+      // springs 600↔732 symmetrically inside it.
       className="flex flex-col items-center w-fit mx-auto h-fit min-h-0 bg-transparent p-0 rounded-[24px] font-sans gap-2 overlay-text-primary"
     >
       {/*
@@ -7404,13 +7523,6 @@ Provide only the answer, nothing else.`;
         inert={!isExpanded}
         className="flex flex-col items-center gap-2 w-full"
       >
-            <TopPill
-              expanded={isExpanded}
-              onToggle={() => setIsExpanded(!isExpanded)}
-              onQuit={() => (onEndMeeting ? onEndMeeting() : window.electronAPI.quitApp())}
-              appearance={appearance}
-              onLogoClick={() => window.electronAPI?.setWindowMode?.('launcher')}
-            />
             <motion.div
               ref={shellRef}
               data-shell-card=""
@@ -7418,13 +7530,14 @@ Provide only the answer, nothing else.`;
               style={{
                 ...appearance.shellStyle,
                 // The panel width is bound to the LIVE `shellWidth` motion value,
-                // animated 600↔780 by OVERLAY_RESIZE_SPRING. The content reflows
+                // animated 600↔732 by OVERLAY_RESIZE_SPRING. The content reflows
                 // (text re-wrap + code re-layout) to the real panel width on every
                 // frame, so it is always correct at every in-between width — there
                 // is no clipping, no phantom layout width, no transform distortion.
-                // The OS window stays a fixed OVERLAY_WINDOW_WIDTH (780) and the
-                // panel is centered (mx-auto) inside it, so this width change never
-                // touches a native setBounds and the X origin never moves.
+                // The OS window stays a fixed OVERLAY_WINDOW_WIDTH (732) and
+                // the panel is centered (mx-auto) inside it, so this width
+                // change never touches a native setBounds, the X origin never
+                // moves, and the panel's center is pixel-stable.
                 //
                 // The cost of reflowing per frame is held down by keeping each
                 // reflow cheap: `contain: layout style` scopes it to this subtree
@@ -7539,73 +7652,172 @@ Provide only the answer, nothing else.`;
                 </div>
               )}
 
-              {/* System Audio / Screen Recording Warning Banner */}
-              {systemAudioWarning && (
-                <div className="flex items-center justify-between mx-4 mt-3 mb-1 px-3.5 py-2.5 bg-yellow-500/10 border border-yellow-500/20 rounded-[12px] shadow-sm relative no-drag group/warning">
-                  <div className="flex flex-col gap-1 pr-3">
-                    <div className="flex items-center gap-2 text-[12.5px] text-yellow-600 dark:text-yellow-400/90 font-medium leading-tight">
-                      <div className="shrink-0 p-1 bg-yellow-500/20 rounded-full">
-                        <svg
-                          className="w-3.5 h-3.5 text-yellow-600 dark:text-yellow-400"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2.5}
-                            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                          />
-                        </svg>
-                      </div>
-                      <span>
-                        {systemAudioWarning.kind === 'screen-recording-permission'
-                          ? t('Screen Recording Permission Denied')
-                          : t('Audio Capture Issue')}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-yellow-600/70 dark:text-yellow-400/60 leading-snug pl-[26px]">
-                      {systemAudioWarning.message}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {/*
-                      UX3: deep-link to the correct macOS System Settings pane
-                      based on the failure channel. Pre-fix the mic-zero-fill /
-                      mic-denied path opened Natively's internal Settings,
-                      which then required the user to read the message, alt-tab
-                      to System Settings, navigate to Privacy & Security, find
-                      Microphone, and toggle Natively. Now one click takes them
-                      directly to the right pane. Falls back to internal
-                      Settings on Windows or when channel is unknown.
-                    */}
-                    {(() => {
-                      const wantsScreenCapturePane =
-                        systemAudioWarning.kind === 'screen-recording-permission' ||
-                        systemAudioWarning.channel === 'system';
-                      const wantsMicrophonePane =
-                        systemAudioWarning.kind === 'audio-capture-failure' &&
-                        systemAudioWarning.channel === 'mic';
-                      const deepLinkUrl = !isMac
-                        ? null
-                        : wantsScreenCapturePane
-                        ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
-                        : wantsMicrophonePane
-                        ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
-                        : null;
-                      return (
-                        <>
-                          <button
+              {/*
+                System Audio / Screen Recording Warning Banner.
+
+                Rendered through the shared <OverlayBanner> primitive (see
+                src/components/ui/OverlayBanner.tsx) — same surface, spacing,
+                type ramp and button hierarchy as the stealth-Accessibility
+                banner further down, which used to be a hand-rolled second
+                design for the identical job.
+
+                Layout: copy on the left, actions trailing right on the SAME
+                row, matching the sibling `sttNotConfigured` banner's
+                `justify-between` shape. Pre-fix the two buttons sat on their
+                own row under a full-width paragraph, floating in the banner's
+                lower-left with the whole right half of the banner empty. The
+                primitive keeps a min-width floor on the copy column so the
+                row wraps (rather than crushing the text into a ~150px ribbon,
+                the shape that shipped the vertical-overflow bug).
+              */}
+              {systemAudioWarning && (() => {
+                /*
+                  Which macOS pane actually FIXES this warning.
+
+                  Derived from `titleKey` first, then `channel`. `channel` is a
+                  TRANSPORT label ('mic' vs 'system' capture stream), not a
+                  remedy label, and the old predicate
+                    wantsScreenCapturePane = kind === 'screen-recording-permission'
+                                             || channel === 'system'
+                  read it as one — so every microphone-fault warning that
+                  arrives on the system channel (anything routed through
+                  sendSystemAudioPermissionDenied, which hard-stamps
+                  channel:'system', e.g. the mic-denied / mic-zero-fill titles)
+                  was told "Open Screen Settings" and deep-linked to Screen
+                  Recording. Same bug sent "Input and Output Are the Same
+                  Device" — a Sound-output misconfiguration with no privacy
+                  pane at all — to Screen Recording.
+
+                  `titleKey` is the reason encoded by main.ts
+                  `permissionTitleKey()`; substring-matched on the RAW key (NOT
+                  t(titleKey) — the ja/ru catalogs translate these, so matching
+                  the rendered string would silently break routing for exactly
+                  those users) so a future "Microphone …" title routes itself.
+                  Keys today: 'Screen Recording Blocked', '… (Dev Build)',
+                  'Screen Recording Restricted', 'Screen Recording Grant
+                  Expired', 'System Audio Unavailable', 'Microphone Blocked',
+                  'Microphone Is Silent', 'Input and Output Are the Same
+                  Device', 'No System Audio for 8s'.
+
+                  Warnings whose title says nothing about a pane keep their
+                  existing channel routing exactly: channel 'mic' → Microphone
+                  pane, channel 'system' → Screen Recording pane, absent
+                  channel → internal Settings (so an undefined channel must be
+                  compared with === 'system', never !== 'mic' — `channel` is
+                  optional on the type and forwarded verbatim from
+                  payload.channel).
+                */
+                const rawTitleKey = systemAudioWarning.titleKey ?? '';
+                const reasonIsMicrophone = rawTitleKey.toLowerCase().includes('microphone');
+                const reasonIsScreenRecording = rawTitleKey
+                  .toLowerCase()
+                  .includes('screen recording');
+                // Neither pane fixes a same-device input/output loop: the user
+                // has to change the OUTPUT device. No verified deep link for
+                // the Sound pane exists in this codebase, so this falls to the
+                // already-wired internal-Settings fallback rather than sending
+                // the user somewhere confidently wrong.
+                const reasonIsAudioDeviceConfig = rawTitleKey
+                  .toLowerCase()
+                  .includes('same device');
+                const wantsMicrophonePane =
+                  reasonIsMicrophone ||
+                  (!reasonIsScreenRecording &&
+                    !reasonIsAudioDeviceConfig &&
+                    systemAudioWarning.kind === 'audio-capture-failure' &&
+                    systemAudioWarning.channel === 'mic');
+                const wantsScreenCapturePane =
+                  !wantsMicrophonePane &&
+                  !reasonIsAudioDeviceConfig &&
+                  (reasonIsScreenRecording ||
+                    systemAudioWarning.kind === 'screen-recording-permission' ||
+                    systemAudioWarning.channel === 'system');
+                const deepLinkUrl = !isMac
+                  ? null
+                  : wantsMicrophonePane
+                  ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
+                  : wantsScreenCapturePane
+                  ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
+                  : null;
+
+                // Identity of THIS warning, so visiting a pane for one problem
+                // does not promote the button on a different problem that
+                // happens to appear next.
+                const warningIdentity = `${systemAudioWarning.kind}:${rawTitleKey}:${systemAudioWarning.channel ?? ''}`;
+                // Exactly one action renders. Restart only replaces the
+                // settings action once the user has actually been sent to the
+                // pane, and only where a restart is what applies the grant —
+                // a device-config fault (same input and output) is fixed by
+                // changing the device, so a restart there would do nothing.
+                const showRestartInstead =
+                  isMac &&
+                  !!deepLinkUrl &&
+                  permissionPaneVisited === warningIdentity;
+                return (
+                  <OverlayBanner
+                    className="mx-4 mt-3 mb-1"
+                    /*
+                      The title is an i18n KEY shipped from the main process
+                      (main.ts `permissionTitleKey`) so it stays localisable
+                      while naming the fault the body no longer repeats.
+                      Emitters that predate it fall back to the original
+                      per-kind titles.
+                    */
+                    title={
+                      systemAudioWarning.titleKey
+                        ? t(systemAudioWarning.titleKey)
+                        : systemAudioWarning.kind === 'screen-recording-permission'
+                        ? t('Screen Recording Permission Denied')
+                        : t('Audio Capture Issue')
+                    }
+                    message={systemAudioWarning.message}
+                    messageTooltip={systemAudioWarning.message}
+                    onDismiss={() => setSystemAudioWarning(null)}
+                    dismissLabel={t('Dismiss')}
+                    actions={
+                      <>
+                        {/*
+                          PRIMARY: open the pane that fixes it. This is step
+                          one of the real task (open → grant → restart), so it
+                          is the only filled button; pre-fix both buttons were
+                          the same amber tint at the same weight and nothing
+                          said which to press first.
+                        */}
+{showRestartInstead ? (
+                          <OverlayBannerButton
+                            variant="primary"
+                            onClick={async () => {
+                              if (appRestarting) return; // in-flight guard
+                              setAppRestarting(true);
+                              try {
+                                await window.electronAPI?.restartApp?.();
+                              } catch (err) {
+                                console.warn('[UI] restart-app failed:', err);
+                                setAppRestarting(false);
+                              }
+                            }}
+                            disabled={appRestarting}
+                            aria-busy={appRestarting}
+                            title={t('macOS often needs a full app restart before a fresh Screen Recording grant takes effect — restart now instead of manually quitting and reopening')}
+                          >
+                            {appRestarting ? t('Restarting…') : t('Restart Now')}
+                          </OverlayBannerButton>
+                        ) : (
+                          <OverlayBannerButton
+                            variant="primary"
                             onClick={() => {
                               if (deepLinkUrl) {
                                 window.electronAPI.openExternal(deepLinkUrl);
+                                // Sending the user to the pane is what makes a
+                                // restart meaningful, so that click is what
+                                // promotes the button.
+                                setPermissionPaneVisited(warningIdentity);
                               } else {
-                                // Windows / unknown channel: fall back to internal Settings.
+                                // Windows / unknown channel / device-config
+                                // faults: fall back to internal Settings.
                                 window.electronAPI?.toggleSettingsWindow?.();
                               }
                             }}
-                            className="px-3 py-1.5 rounded-lg bg-yellow-500/15 hover:bg-yellow-500/25 text-yellow-700 dark:text-yellow-500 text-[11px] font-semibold transition-all active:scale-95 border border-yellow-500/20 shadow-sm"
                             title={
                               deepLinkUrl
                                 ? wantsMicrophonePane
@@ -7619,79 +7831,25 @@ Provide only the answer, nothing else.`;
                                 ? t('Open Mic Settings')
                                 : t('Open Screen Settings')
                               : t('Open Settings')}
-                          </button>
-                          {/*
-                            UX2: in-app TCC repair button. macOS only.
-                            Shows when the banner is from a TCC-related failure
-                            (any audio-capture-failure path or screen-recording
-                            permission denial). The dominant root cause of
-                            "permissions granted but no transcription" is TCC
-                            cdhash drift across rebuilds; this button gives the
-                            user a one-click recovery without having to know
-                            about tccutil or terminal commands. After reset
-                            the user must fully quit (Cmd+Q) and reopen.
-                          */}
-                          {isMac && (
-                            <button
-                              onClick={async () => {
-                                if (tccRepairing) return; // in-flight guard
-                                setTccRepairing(true);
-                                try {
-                                  const result = await window.electronAPI?.repairTccPermissions?.();
-                                  if (result) {
-                                    // Show the returned message via the existing
-                                    // banner; user can dismiss when ready.
-                                    setSystemAudioWarning({
-                                      kind: 'audio-capture-failure',
-                                      message: result.message,
-                                      channel: systemAudioWarning.channel,
-                                    });
-                                  }
-                                } catch (err) {
-                                  console.warn('[UI] repair-tcc-permissions failed:', err);
-                                } finally {
-                                  setTccRepairing(false);
-                                }
-                              }}
-                              disabled={tccRepairing}
-                              className="px-3 py-1.5 rounded-lg bg-yellow-500/10 hover:bg-yellow-500/20 text-yellow-700 dark:text-yellow-500 text-[11px] font-medium transition-all active:scale-95 border border-yellow-500/15 disabled:opacity-60 disabled:cursor-not-allowed"
-                              title={t("Reset macOS permission entries for Natively (you will need to grant them again after relaunch)")}
-                            >
-                              {tccRepairing ? t('Resetting…') : t('Repair Permissions')}
-                            </button>
-                          )}
-                          {isMac && systemAudioWarning.kind === 'screen-recording-permission' && (
-                            <button
-                              onClick={async () => {
-                                if (appRestarting) return; // in-flight guard
-                                setAppRestarting(true);
-                                try {
-                                  await window.electronAPI?.restartApp?.();
-                                } catch (err) {
-                                  console.warn('[UI] restart-app failed:', err);
-                                  setAppRestarting(false);
-                                }
-                              }}
-                              disabled={appRestarting}
-                              className="px-3 py-1.5 rounded-lg bg-yellow-500/15 hover:bg-yellow-500/25 text-yellow-700 dark:text-yellow-500 text-[11px] font-semibold transition-all active:scale-95 border border-yellow-500/20 shadow-sm disabled:opacity-60 disabled:cursor-not-allowed"
-                              title={t('macOS often needs a full app restart before a fresh Screen Recording grant takes effect — restart now instead of manually quitting and reopening')}
-                            >
-                              {appRestarting ? t('Restarting…') : t('Restart Now')}
-                            </button>
-                          )}
-                        </>
-                      );
-                    })()}
-                    <button
-                      onClick={() => setSystemAudioWarning(null)}
-                      className="p-1.5 rounded-full hover:bg-black/5 dark:hover:bg-white/10 text-yellow-600/50 hover:text-yellow-700 dark:text-yellow-500/50 dark:hover:text-yellow-400 transition-colors absolute top-1 right-1 opacity-0 group-hover/warning:opacity-100"
-                      title={t("Dismiss")}
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  </div>
-                </div>
-              )}
+                          </OverlayBannerButton>
+                        )}
+                        {/*
+                          SECONDARY: the follow-up step. The banner carries
+                          exactly two actions: open the right pane, then
+                          relaunch (macOS does not apply a fresh Screen
+                          Recording grant until the app restarts). The third
+                          button — "Repair Permissions", a tccutil reset — was
+                          removed here: three same-weight buttons crowded the
+                          strip, and it is a last-resort recovery rather than
+                          the step a user takes next. `repairTccPermissions`
+                          remains wired in preload/ipcHandlers; it currently
+                          has no other UI entry point.
+                        */}
+                                              </>
+                    }
+                  />
+                );
+              })()}
 
               {/* PR #173: STT Not Configured Warning Banner */}
               {sttNotConfigured && (
@@ -7912,21 +8070,23 @@ Provide only the answer, nothing else.`;
                     height, no scroll-content dependency and no magic pixel
                     offsets.
 
-                    Styled to match ResizeToggle (src/components/ui/ResizeToggle.tsx)
-                    at the user's request: same 28px jelly-pill material
-                    (.overlay-resize-toggle-surface + appearance.shellStyle,
-                    the same "floating chrome outside the content, reads as
-                    the panel's own material" recipe), same gloss-sheen
-                    overlay, same mount-pop/hover/tap motion curve. Unlike
-                    ResizeToggle this pill does NOT default to a dimmed 0.72
-                    opacity — that dimming exists there because window-chrome
-                    controls should recede until interacted with, but this
-                    pill only ever appears when there's actually something to
-                    jump to, so staying fully visible is the right call for
-                    what is effectively a lightweight notification affordance. */}
+                    Sized and positioned to match ResizeToggle
+                    (src/components/ui/ResizeToggle.tsx) at the user's
+                    request, but NOT the same material or motion — see the
+                    style/transition comments on the element below for the
+                    current surface (overlay-icon-surface) and animation
+                    (asymmetric spring-in / ease-out-exit) actually in use.
+                    Unlike ResizeToggle this pill does NOT default to a
+                    dimmed 0.72 opacity — that dimming exists there because
+                    window-chrome controls should recede until interacted
+                    with, but this pill only ever appears when there's
+                    actually something to jump to, so staying fully visible
+                    is the right call for what is effectively a lightweight
+                    notification affordance. */}
                 <AnimatePresence>
-                  {autoScroll && showJumpToLatest && (
+                  {showJumpToLatest && (
                     <motion.button
+                      key="jump-to-latest"
                       type="button"
                       // Same "don't steal focus from the chat input" idiom
                       // ResizeToggle uses — see its onMouseDown comment.
@@ -7953,27 +8113,136 @@ Provide only the answer, nothing else.`;
                       // buttons etc.) — deliberately a lighter tone so
                       // embedded controls pop against the panel body instead
                       // of blending into it.
+                      //
+                      // No inline border here (a previous version hardcoded
+                      // one): every other .overlay-icon-surface consumer in
+                      // this file (e.g. the X/remove-attachment button) is
+                      // borderless and lets each theme's CSS own the edge
+                      // treatment entirely — modern's rule sets a real
+                      // `border` with !important, but liquid-glass's rule
+                      // deliberately has NO border at all, relying purely on
+                      // its box-shadow insets for the glass edge highlight
+                      // (matching border-color:transparent on the sibling
+                      // .overlay-resize-toggle-surface glass rule). A
+                      // hardcoded inline border here would sit on top of the
+                      // glass box-shadow and read as a generic flat outline
+                      // instead of the intended glass look — dropping it
+                      // lets default/liquid-glass/modern each fully own their
+                      // own established per-theme styling, which is what
+                      // "same style as default, liquid-glass-y in glass,
+                      // modern-y in modern" actually means here.
                       className="absolute right-3 bottom-full mb-2 z-20 no-drag flex h-[28px] w-[28px] items-center justify-center overflow-hidden rounded-full overlay-icon-surface overlay-icon-surface-hover overlay-text-interactive"
-                      style={{
-                        ...appearance.iconStyle,
-                        borderWidth: '1px',
-                        borderStyle: 'solid',
-                        borderColor: 'rgba(255, 255, 255, 0.14)',
-                      }}
-                      initial={prefersReducedMotionRef.current ? { opacity: 0 } : { opacity: 0, scale: 0.8 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      exit={prefersReducedMotionRef.current ? { opacity: 0 } : { opacity: 0, scale: 0.8 }}
-                      whileHover={prefersReducedMotionRef.current ? undefined : { scale: 1.06 }}
-                      whileTap={prefersReducedMotionRef.current ? undefined : { scale: 0.92 }}
-                      transition={{ duration: 0.2, ease: [0.23, 1, 0.32, 1] }}
+                      // `position: 'absolute'` inline is NOT redundant with the
+                      // `absolute` Tailwind class above — modern theme's own
+                      // `[data-interface-theme="modern"] .overlay-icon-surface`
+                      // rule (index.css) sets `position: relative` (needed for
+                      // that rule's own ::before gloss pseudo-element, which
+                      // every other .overlay-icon-surface consumer wants,
+                      // since none of them are absolutely positioned floating
+                      // chrome like this pill is). That selector is MORE
+                      // specific than a bare `.absolute` utility class (two
+                      // class-level selectors vs one) and isn't tagged
+                      // !important, so in modern theme it silently won the
+                      // cascade and knocked this button out of its intended
+                      // floating position back into normal document flow —
+                      // confirmed live: the pill rendered pinned to the row's
+                      // LEFT edge instead of floating top-right in modern
+                      // theme only (default/liquid-glass don't set `position`
+                      // on this class at all, so they were unaffected). An
+                      // inline style always wins over a non-!important class
+                      // rule regardless of selector specificity, so this is
+                      // the surgical fix — no change to the shared class used
+                      // by every other embedded icon button in the app.
+                      style={{ ...appearance.iconStyle, position: 'absolute' }}
+                      // Asymmetric enter/exit, not the same curve reversed.
+                      // Enter: this pill is a notification-style affordance
+                      // (see the block comment above) that appears because
+                      // the user just made a deliberate scroll-up gesture —
+                      // it should feel like it rises up to meet them, so it
+                      // slides up a few px (y: 6 -> 0) while it fades/scales
+                      // in, using a spring (not the file's usual tween) for
+                      // the same "alive" quality ResizeToggle's icon-swap
+                      // reserves for its own state changes. Exit: the user
+                      // scrolled back to the bottom themselves (or clicked
+                      // it) — there's nothing left to communicate, so it
+                      // should get out of the way fast. It settles down
+                      // slightly (y: 0 -> 4, the mirror-opposite direction of
+                      // the entrance) on the file's established strong
+                      // ease-out curve at a shorter duration than the
+                      // entrance, rather than reusing the entrance transition
+                      // in reverse.
+                      initial={
+                        prefersReducedMotionRef.current
+                          ? { opacity: 0 }
+                          : { opacity: 0, scale: 0.9, y: 6 }
+                      }
+                      animate={
+                        prefersReducedMotionRef.current
+                          ? { opacity: 1, transition: { duration: 0.15, ease: [0.23, 1, 0.32, 1] } }
+                          : {
+                              opacity: 1,
+                              scale: 1,
+                              y: 0,
+                              transition: { type: 'spring', duration: 0.4, bounce: 0.22 },
+                            }
+                      }
+                      exit={
+                        prefersReducedMotionRef.current
+                          ? { opacity: 0, transition: { duration: 0.12, ease: [0.23, 1, 0.32, 1] } }
+                          : {
+                              opacity: 0,
+                              scale: 0.95,
+                              y: 4,
+                              transition: { duration: 0.15, ease: [0.23, 1, 0.32, 1] },
+                            }
+                      }
+                      whileHover={
+                        prefersReducedMotionRef.current
+                          ? undefined
+                          : { scale: 1.06, transition: { duration: 0.15, ease: [0.23, 1, 0.32, 1] } }
+                      }
+                      whileTap={
+                        prefersReducedMotionRef.current
+                          ? undefined
+                          : { scale: 0.92, transition: { duration: 0.1, ease: [0.23, 1, 0.32, 1] } }
+                      }
                     >
-                      {/* Jelly-gloss sheen — identical to ResizeToggle's */}
-                      <span className="pointer-events-none absolute inset-x-1 top-0.5 h-[45%] rounded-full bg-gradient-to-b from-white/20 to-white/0 blur-[0.5px]" />
+                      {/* No manual gloss-sheen span here (an earlier version
+                          copied ResizeToggle's jelly-gloss <span> wholesale).
+                          Removed: the other overlay-icon-surface consumer in
+                          this file (the X/remove-attachment button, ~line
+                          8116) has no such decoration and relies entirely on
+                          the shared CSS class for its per-theme look — modern
+                          theme's own `.overlay-icon-surface::before` rule
+                          already generates an equivalent gloss pseudo-element
+                          purely in CSS, so a manual span duplicated it there,
+                          and liquid-glass's box-shadow insets already supply
+                          its own highlight. In DEFAULT theme specifically the
+                          manual sheen had no CSS counterpart to duplicate, so
+                          it just added an out-of-place glossy highlight none
+                          of this theme's other flat embedded buttons have —
+                          exactly the "mixed-in modern styling" this button
+                          shouldn't have. Dropping it makes all three themes
+                          consistent with how every other overlay-icon-surface
+                          button in the app is styled: pure CSS-class-driven,
+                          no bespoke JSX decoration layered on top. */}
                       <span
                         className="relative grid place-items-center"
                         style={{ transform: 'translate(-0.5px, -0.5px)' }}
                       >
-                        <ChevronDown className="h-3.5 w-3.5" strokeWidth={2} />
+                        {/* ArrowDown, not ChevronDown — this file already
+                            uses a plain ChevronDown for an unrelated
+                            expand/collapse accordion affordance (~line 8397),
+                            so reusing it here for "jump to latest" would
+                            collide with that established meaning. A caret
+                            reads as "expand/more options"; a stemmed arrow
+                            reads unambiguously as "scroll/jump to end" even
+                            at this button's small (14px) render size, where
+                            the previously-used double-chevron (ChevronsDown)
+                            visually compressed into what looked like a single
+                            plain arrow anyway — confirmed live via
+                            screenshot. */}
+                        <ArrowDown className="h-3.5 w-3.5" strokeWidth={2} />
                       </span>
                     </motion.button>
                   )}
@@ -8130,47 +8399,55 @@ Provide only the answer, nothing else.`;
                                     Rust module ships only in the Darwin binary. Gating here
                                     is belt-and-suspenders on top of the native-side gate. */}
                 {isMac && stealthPermissionMissing && (
-                  <div
-                    className="mb-2 px-3 py-2 rounded-xl border border-amber-400/40 bg-amber-500/10 text-[11px] flex items-center gap-2"
+                  <OverlayBanner
+                    className="mb-2"
                     data-stealth-ignore="true"
-                  >
-                    <span className="overlay-text-primary flex-1">
-                      {t('Stealth typing needs Accessibility access. Grant it in System Settings, then restart Natively.')}
-                    </span>
-                    <button
-                      onClick={() => window.electronAPI.stealthTapOpenSettings()}
-                      className="px-2 py-1 rounded-md bg-amber-500/20 hover:bg-amber-500/30 transition-colors text-[11px] font-medium overlay-text-primary whitespace-nowrap"
-                      data-stealth-ignore="true"
-                    >
-                      {t('Open Settings')}
-                    </button>
-                    <button
-                      onClick={async () => {
-                        if (appRestarting) return; // in-flight guard
-                        setAppRestarting(true);
-                        try {
-                          await window.electronAPI?.restartApp?.();
-                        } catch (err) {
-                          console.warn('[UI] restart-app failed:', err);
-                          setAppRestarting(false);
-                        }
-                      }}
-                      disabled={appRestarting}
-                      className="px-2 py-1 rounded-md bg-amber-500/10 hover:bg-amber-500/20 transition-colors text-[11px] font-medium overlay-text-primary whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed"
-                      data-stealth-ignore="true"
-                      title={t('Accessibility grants often need a full app restart to take effect')}
-                    >
-                      {appRestarting ? t('Restarting…') : t('Restart Now')}
-                    </button>
-                    <button
-                      onClick={() => setStealthPermissionMissing(false)}
-                      className="px-1.5 py-1 rounded-md hover:bg-white/10 transition-colors text-[11px] overlay-text-muted"
-                      aria-label={t("Dismiss")}
-                      data-stealth-ignore="true"
-                    >
-                      ×
-                    </button>
-                  </div>
+                    /*
+                      Unified onto the same primitive as the system-audio
+                      banner above: same surface, radius, padding, type ramp,
+                      icon chip, primary/secondary button pair and inline ✕.
+                      Previously this was a second design for the same job
+                      (bare sentence + three flat amber buttons + a "×" glyph).
+                      The heading is new; the sentence below it is byte-for-byte
+                      the existing key, which has shipped ja/ru translations.
+                    */
+                    title={t('Accessibility Access Needed')}
+                    message={t('Stealth typing needs Accessibility access. Grant it in System Settings, then restart Natively.')}
+                    onDismiss={() => setStealthPermissionMissing(false)}
+                    dismissLabel={t('Dismiss')}
+                    dismissButtonProps={{ 'data-stealth-ignore': 'true' }}
+                    actions={
+                      <>
+                        <OverlayBannerButton
+                          variant="primary"
+                          onClick={() => window.electronAPI.stealthTapOpenSettings()}
+                          title={t('Open macOS Accessibility privacy settings')}
+                          data-stealth-ignore="true"
+                        >
+                          {t('Open Settings')}
+                        </OverlayBannerButton>
+                        <OverlayBannerButton
+                          variant="secondary"
+                          onClick={async () => {
+                            if (appRestarting) return; // in-flight guard
+                            setAppRestarting(true);
+                            try {
+                              await window.electronAPI?.restartApp?.();
+                            } catch (err) {
+                              console.warn('[UI] restart-app failed:', err);
+                              setAppRestarting(false);
+                            }
+                          }}
+                          disabled={appRestarting}
+                          aria-busy={appRestarting}
+                          data-stealth-ignore="true"
+                          title={t('Accessibility grants often need a full app restart to take effect')}
+                        >
+                          {appRestarting ? t('Restarting…') : t('Restart Now')}
+                        </OverlayBannerButton>
+                      </>
+                    }
+                  />
                 )}
 
                 {/* data-stealth-engage marks this subtree as
@@ -8212,6 +8489,11 @@ Provide only the answer, nothing else.`;
                         }
                       }
                       if (e.key !== 'Enter' || e.repeat) return;
+                      // Cmd/Ctrl+Enter belongs to general:process-screenshots.
+                      // Let it bubble to the window keydown handler instead of
+                      // submitting — handleManualSubmit silently returns on an
+                      // empty input, which is why the shortcut appeared dead.
+                      if (e.metaKey || e.ctrlKey) return;
                       e.preventDefault();
                       handleManualSubmit();
                     }}
@@ -8326,6 +8608,7 @@ Provide only the answer, nothing else.`;
 
                     <div className="relative">
                       <button
+                        data-settings-toggle="true"
                         onClick={(e) => {
                           if (isSettingsOpen) {
                             // If open, just close it (toggle will handle logic but we can be explicit or just toggle)
