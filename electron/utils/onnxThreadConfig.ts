@@ -77,9 +77,36 @@ function readBoolEnv(name: string, fallback: boolean): boolean {
  * Kept as a fresh object per call (session_options is merged/mutated by
  * transformers.js internals — never share one object across sessions).
  */
+/**
+ * Default intra-op thread count.
+ *
+ * The single-thread default was introduced as the "conservative half" of a fix
+ * for a macOS crash (BFCArena::Extend / posix_memalign on 16GB Apple Silicon
+ * with several ONNX consumers live). It was applied to EVERY platform, which
+ * pins Whisper inference to one core everywhere.
+ *
+ * Measured cost, from a packaged Windows build's own telemetry:
+ *
+ *   [LocalWhisperSTT/whisper-small:mic] latency · final: n=1 p50=12176ms
+ *
+ * 12.2s to transcribe one segment — roughly 10x slower than the speech being
+ * transcribed. Results land after the meeting has ended, so the app looks like
+ * it produces no transcript at all, with nothing failing.
+ *
+ * macOS keeps 1 (the crash it mitigates is real and platform-specific).
+ * Elsewhere, scale with the machine but stay bounded: half the cores, capped at
+ * 4, so a Whisper session cannot monopolise the box or reintroduce the arena
+ * pressure the cap was guarding against. Both remain env-overridable.
+ */
+function defaultIntraOpThreads(): number {
+    if (process.platform === 'darwin') return 1;
+    const cores = os.cpus?.()?.length ?? 1;
+    return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+}
+
 export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
     return {
-        intraOpNumThreads: readIntEnv('NATIVELY_ONNX_INTRA_OP_THREADS', 1),
+        intraOpNumThreads: readIntEnv('NATIVELY_ONNX_INTRA_OP_THREADS', defaultIntraOpThreads()),
         interOpNumThreads: readIntEnv('NATIVELY_ONNX_INTER_OP_THREADS', 1),
         executionMode: 'sequential',
         // Disable ORT's persistent BFCArena/memory-pattern reuse by default.

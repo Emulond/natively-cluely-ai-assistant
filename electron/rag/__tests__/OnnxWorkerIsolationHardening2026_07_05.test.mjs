@@ -42,6 +42,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import Module from 'node:module';
 import { EventEmitter } from 'node:events';
+import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -165,14 +166,26 @@ describe('worker isolation — source guards', () => {
 // ---------------------------------------------------------------------------
 
 describe('getBoundedOnnxSessionOptions', () => {
+
+// Intra-op default is platform-aware since the Whisper latency fix: macOS stays
+// at 1 (it mitigates a real BFCArena/posix_memalign crash there), while other
+// platforms scale with the machine — a packaged Windows build measured 12.2s to
+// transcribe ONE segment while pinned to a single thread, so results arrived
+// after the meeting had ended. Bounded at half the cores, max 4.
+function expectedIntraOpDefault() {
+  if (process.platform === 'darwin') return 1;
+  const cores = os.cpus()?.length ?? 1;
+  return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+}
+
   const modPath = path.resolve(repoRoot, 'dist-electron/electron/utils/onnxThreadConfig.js');
 
-  test('defaults to 1 intra-op + 1 inter-op thread, sequential execution mode', async () => {
+  test('defaults to a bounded intra-op count + 1 inter-op thread, sequential execution mode', async () => {
     delete process.env.NATIVELY_ONNX_INTRA_OP_THREADS;
     delete process.env.NATIVELY_ONNX_INTER_OP_THREADS;
     const { getBoundedOnnxSessionOptions } = await import(pathToFileURL(modPath).href);
     const opts = getBoundedOnnxSessionOptions();
-    assert.equal(opts.intraOpNumThreads, 1);
+    assert.equal(opts.intraOpNumThreads, expectedIntraOpDefault());
     assert.equal(opts.interOpNumThreads, 1);
     assert.equal(opts.executionMode, 'sequential');
   });
@@ -191,13 +204,13 @@ describe('getBoundedOnnxSessionOptions', () => {
     }
   });
 
-  test('invalid/non-positive env overrides fall back to the safe default (1)', async () => {
+  test('invalid/non-positive env overrides fall back to the safe platform default', async () => {
     process.env.NATIVELY_ONNX_INTRA_OP_THREADS = '-5';
     process.env.NATIVELY_ONNX_INTER_OP_THREADS = 'not-a-number';
     try {
       const { getBoundedOnnxSessionOptions } = await import(pathToFileURL(modPath).href);
       const opts = getBoundedOnnxSessionOptions();
-      assert.equal(opts.intraOpNumThreads, 1);
+      assert.equal(opts.intraOpNumThreads, expectedIntraOpDefault());
       assert.equal(opts.interOpNumThreads, 1);
     } finally {
       delete process.env.NATIVELY_ONNX_INTRA_OP_THREADS;

@@ -53,9 +53,14 @@ test('defaults disable CPU memory arena and memory pattern', () => {
     const opts = getBoundedOnnxSessionOptions();
     assert.equal(opts.enableCpuMemArena, false, 'expected CPU memory arena to be disabled by default');
     assert.equal(opts.enableMemPattern, false, 'expected memory pattern to be disabled by default');
-    // Thread bounds are unchanged from the conservative defaults already
-    // covered by OnnxWorkerIsolationHardening2026_07_05.test.mjs.
-    assert.equal(opts.intraOpNumThreads, 1);
+    // Intra-op is platform-aware since the Whisper latency fix (single-threaded
+    // inference measured 12.2s per segment on packaged Windows); the arena and
+    // mem-pattern flags this test covers are unaffected by that change. Full
+    // coverage lives in utils/__tests__/OnnxThreadDefaults.test.mjs.
+    const expectedIntra = process.platform === 'darwin'
+      ? 1
+      : Math.max(1, Math.min(4, Math.floor((os.cpus()?.length ?? 1) / 2)));
+    assert.equal(opts.intraOpNumThreads, expectedIntra);
     assert.equal(opts.interOpNumThreads, 1);
     assert.equal(opts.executionMode, 'sequential');
   });
