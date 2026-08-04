@@ -36,7 +36,7 @@ import { Worker } from 'worker_threads';
 import { resampleToF32 } from './whisper/audioResampler';
 import { VadProcessor } from './whisper/vadProcessor';
 import { filterHallucination } from './whisper/hallucinationFilter';
-import { configureTransformersCache, getModelSizeBytes } from './whisper/modelManager';
+import { configureTransformersCache, getModelSizeBytes, getMultilingualModelNames, isMultilingualModel } from './whisper/modelManager';
 import { clearLoadSentinel, modelPreloader, writeLoadSentinel } from './whisper/modelPreloader';
 import { buildWorkerInitMessage } from './whisper/inferenceConfig';
 import { resolveWhisperWorkerPath } from './whisper/workerPathResolver';
@@ -127,6 +127,14 @@ export class LocalWhisperSTT extends EventEmitter {
             ` pending=${this.pendingAudio.length}` +
             ` droppedInactive=${this.diagDroppedInactive} droppedNoWorker=${this.diagDroppedNoWorker}` +
             ` droppedBackpressure=${this.diagDroppedBackpressure} inFlight=${this.inFlightTranscribes}` +
+            // The worker cannot report its own elapsed time while ONNX is
+            // running (its timers starve), so name the outstanding tasks here.
+            // "inFlight=2 stuck=t1,t2" is the signature of a model too slow for
+            // this machine; "inFlight=2" with the ids changing every line is
+            // just a busy pipeline.
+            (this.taskWatchdogs.size > 0
+                ? ` outstanding=${[...this.taskWatchdogs.keys()].join(',')}`
+                : '') +
             ` | active=${this.isActive} vad=${!!this.vad} worker=${!!this.worker} ready=${this.workerReady}`,
         );
         this.diagChunks = 0;
@@ -256,7 +264,28 @@ export class LocalWhisperSTT extends EventEmitter {
 
     setSampleRate(rate: number): void { this.inputSampleRate = rate; }
     setAudioChannelCount(_count: number): void {}
-    setRecognitionLanguage(key: string): void { this.language = key || 'auto'; }
+    setRecognitionLanguage(key: string): void {
+        this.language = key || 'auto';
+        this.warnIfLanguageUnsupportedByModel();
+    }
+
+    /**
+     * Say so, in the log, when the chosen language and the chosen model cannot
+     * work together. Selecting Russian on an English-only checkpoint produces
+     * either English words or no words at all, and both look like a broken
+     * transcriber rather than an impossible pairing.
+     */
+    private warnIfLanguageUnsupportedByModel(): void {
+        const lang = this.language;
+        if (!lang || lang === 'auto' || lang.startsWith('english')) return;
+        if (isMultilingualModel(this.modelId)) return;
+        const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+        console.warn(
+            `[LocalWhisperSTT${tag}] language "${lang}" was selected but ${this.modelId} is ` +
+            `English-only — it cannot produce ${lang} no matter how clear the audio is. ` +
+            `Choose a multilingual model in Settings → Audio (${getMultilingualModelNames().join(', ')}).`,
+        );
+    }
     setCredentials(_credPath: string): void {}
 
     /**
@@ -294,6 +323,9 @@ export class LocalWhisperSTT extends EventEmitter {
         this.isDrainingFinals = false;
         this.drainingFinalsInFlight = 0;
         this.isActive = true;
+        // Repeat here as well as in setRecognitionLanguage: by now the channel
+        // label is set, so the warning says which channel is misconfigured.
+        this.warnIfLanguageUnsupportedByModel();
         this.vad = new VadProcessor();
         this.spawnWorker().catch((err) => {
             // Gate refusal or worker spawn failure (e.g. insufficient memory for
@@ -466,7 +498,7 @@ export class LocalWhisperSTT extends EventEmitter {
             // too — otherwise inFlightTranscribes only ever climbs and the
             // backpressure check would permanently block all future dispatch,
             // converting a slow worker into a silent one.
-            this.noteTranscribeResolved();
+            this.noteTranscribeResolved(stuckTaskId ?? undefined);
             this.streamingTaskInFlight = false;
             this.streamingTaskId = null;
             this.streamingStallCount = 0;
@@ -718,11 +750,76 @@ export class LocalWhisperSTT extends EventEmitter {
         const taskId = `${streaming ? 's' : 't'}${++this.taskCounter}`;
         const copy = audio.slice();
         this.inFlightTranscribes++;
+        this.armTaskWatchdog(taskId, copy.length / 16000);
         this.worker.postMessage(
             { type: 'transcribe', taskId, audio: copy, language: this.language, streaming },
             [copy.buffer]
         );
     }
+
+    /**
+     * Per-task watchdog covering FINALS as well as streaming passes.
+     *
+     * Only streaming tasks used to be watched. Finals were not, and a slow model
+     * turned that gap into total silence — from a packaged Windows build running
+     * whisper-large-v3-turbo on CPU:
+     *
+     *   transcribe START task=t1 samples=25440 (1.59s)   <- never returned
+     *   ... inFlight=2 droppedBackpressure=1
+     *   ... inFlight=2 droppedBackpressure=2   (every later phrase dropped)
+     *
+     * Two finals went out, neither came back, inFlightTranscribes stayed pinned
+     * at the backpressure limit, and the channel refused every phrase for the
+     * rest of the meeting. The worker cannot report this itself — heavy ONNX
+     * inference starves its timers (see whisperWorker's watchdog caveat) — so the
+     * host, whose event loop stays free, has to be the one holding the stopwatch.
+     *
+     * On expiry the slot is released so the channel keeps accepting speech. A
+     * result that arrives after this point is still delivered; the taskId is kept
+     * in timedOutTasks only so its late arrival doesn't decrement the counter
+     * twice and over-admit work into a worker that is demonstrably still busy.
+     */
+    private armTaskWatchdog(taskId: string, audioSeconds: number): void {
+        // Scale with the audio: a 14s segment legitimately takes longer than a
+        // 1s one. Past the cap the result is too late to be worth anything.
+        const budget = Math.min(
+            LocalWhisperSTT.TASK_WATCHDOG_MAX_MS,
+            Math.max(LocalWhisperSTT.TASK_WATCHDOG_MIN_MS, audioSeconds * 1000 * 8),
+        );
+        const startedAt = Date.now();
+        const timer = setTimeout(() => {
+            this.taskWatchdogs.delete(taskId);
+            // A task still outstanding when the session ends is expected, not a
+            // fault — don't accuse the model of being slow on the way out.
+            if (!this.isActive && !this.isDrainingFinals) {
+                this.noteTranscribeResolved(taskId);
+                return;
+            }
+            const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+            console.warn(
+                `[LocalWhisperSTT${tag}] task ${taskId} has not returned after ` +
+                `${Date.now() - startedAt}ms for ${audioSeconds.toFixed(2)}s of audio ` +
+                `(model=${this.modelId}) — releasing its queue slot so later speech is ` +
+                `still accepted. This model is too slow for real-time on this machine.`,
+            );
+            this.noteTranscribeResolved(taskId);
+        }, budget);
+        if (typeof timer.unref === 'function') timer.unref();
+        this.taskWatchdogs.set(taskId, timer);
+    }
+
+    private taskWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
+    /**
+     * Task ids whose queue slot has already been given back, so whichever of
+     * result / error / watchdog arrives second is a no-op. Without this, a task
+     * that times out and then answers anyway is counted down twice and the
+     * channel over-admits work into a worker that is demonstrably still busy.
+     * Bounded — only the recent tail can produce a duplicate.
+     */
+    private releasedTasks = new Set<string>();
+    private static readonly RELEASED_TASK_MEMORY = 64;
+    private static readonly TASK_WATCHDOG_MIN_MS = 25000;
+    private static readonly TASK_WATCHDOG_MAX_MS = 120000;
 
     /**
      * Number of transcribe messages posted to the worker but not yet resolved.
@@ -758,8 +855,28 @@ export class LocalWhisperSTT extends EventEmitter {
      */
     private static readonly MAX_INFLIGHT_TRANSCRIBES = 2;
 
-    private noteTranscribeResolved(): void {
+    /** Give a task's queue slot back, exactly once per task. */
+    private noteTranscribeResolved(taskId?: string): void {
+        if (taskId) {
+            const timer = this.taskWatchdogs.get(taskId);
+            if (timer) {
+                clearTimeout(timer);
+                this.taskWatchdogs.delete(taskId);
+            }
+            if (this.releasedTasks.has(taskId)) return;
+            this.releasedTasks.add(taskId);
+            if (this.releasedTasks.size > LocalWhisperSTT.RELEASED_TASK_MEMORY) {
+                const oldest = this.releasedTasks.values().next().value;
+                if (oldest !== undefined) this.releasedTasks.delete(oldest);
+            }
+        }
         this.inFlightTranscribes = Math.max(0, this.inFlightTranscribes - 1);
+    }
+
+    private clearAllTaskWatchdogs(): void {
+        for (const timer of this.taskWatchdogs.values()) clearTimeout(timer);
+        this.taskWatchdogs.clear();
+        this.releasedTasks.clear();
     }
 
     /* ──────────────── Worker lifecycle ──────────────── */
@@ -868,14 +985,14 @@ export class LocalWhisperSTT extends EventEmitter {
                 // agreement baseline is reset on every final dispatch and the
                 // taskId is invalidated, so a late partial would otherwise
                 // corrupt the next segment.
-                this.noteTranscribeResolved();
+                this.noteTranscribeResolved(msg.taskId);
                 if (msg.taskId !== this.streamingTaskId) {
                     this.streamingTaskInFlight = false;
                     return;
                 }
                 this.handleStreamingPartial(msg.text);
             } else if (msg.type === 'result') {
-                this.noteTranscribeResolved();
+                this.noteTranscribeResolved(msg.taskId);
                 const text = filterHallucination(msg.text);
                 // A result that arrives and is then filtered to nothing is
                 // indistinguishable, from the outside, from a result that never
@@ -907,7 +1024,7 @@ export class LocalWhisperSTT extends EventEmitter {
                     }
                 }
             } else if (msg.type === 'error') {
-                this.noteTranscribeResolved();
+                this.noteTranscribeResolved(msg.taskId);
                 console.error('[LocalWhisperSTT] Worker error:', msg.message);
                 if (this.isDrainingFinals && msg.taskId?.startsWith('t')) {
                     this.drainingFinalsInFlight = Math.max(0, this.drainingFinalsInFlight - 1);
@@ -942,6 +1059,8 @@ export class LocalWhisperSTT extends EventEmitter {
             // permanently pin streamingTaskInFlight=true (which would freeze
             // the loop — symptom: transcription stops after 3-4 questions).
             this.clearStreamingWatchdog();
+            this.clearAllTaskWatchdogs();
+            this.inFlightTranscribes = 0;
             this.streamingTaskInFlight = false;
             this.streamingTaskId = null;
             // Free the shared ONNX gate slot — Whisper's session is gone.
@@ -978,6 +1097,8 @@ export class LocalWhisperSTT extends EventEmitter {
             }
             modelPreloader.recordLoadFailure(this.modelId);
             this.clearStreamingWatchdog();
+            this.clearAllTaskWatchdogs();
+            this.inFlightTranscribes = 0;
             if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
             this.markWorkerGone();
             const hadInFlight = this.streamingTaskInFlight;

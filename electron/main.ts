@@ -3412,7 +3412,18 @@ export class AppState {
           zerofillLatched = true;
         } else if (now - firstChunkAt >= ZEROFILL_OBSERVATION_MS) {
           zerofillTriggered = true;
-          console.warn(`${prefix}Mic chunks all zero-filled (peak-to-peak < 100) for ${ZEROFILL_OBSERVATION_MS / 1000}s — TCC denial or device-mute suspected.`);
+          // Ordered by what is actually most likely on each platform. On Windows
+          // the overwhelmingly common cause is a noise-suppression gate holding
+          // the line at digital zero until someone speaks — SteelSeries Sonar's
+          // ClearCast, NVIDIA Broadcast, Krisp all do this by design. Naming
+          // "TCC denial" first was a macOS-shaped guess that reads as an
+          // accusation against hardware that is working exactly as sold.
+          console.warn(
+            `${prefix}Mic chunks all zero-filled (peak-to-peak < 100) for ${ZEROFILL_OBSERVATION_MS / 1000}s — ` +
+            (process.platform === 'win32'
+              ? 'nobody has spoken yet, an AI noise gate (SteelSeries Sonar / NVIDIA Broadcast / Krisp) is holding the line silent, or the device is muted.'
+              : 'microphone permission denial or device-mute suspected.'),
+          );
           this.sendAudioCaptureFailed( {
             channel: 'mic',
             message: formatPermissionMessage('mic-zero-fill'),
@@ -4905,11 +4916,26 @@ export class AppState {
     // this app: chunks arrive on schedule, carrying nothing. Summarise each
     // probe (peak + mean over ~2s) so the log distinguishes "device silent"
     // from "device not opened" without needing the meter on screen.
+    //
+    // A silent WINDOW is not a fault, and must not be logged as one. Mics with
+    // AI noise suppression — SteelSeries Sonar's ClearCast, NVIDIA Broadcast,
+    // Krisp — gate their output to exact digital zeros whenever you are not
+    // speaking; that is the feature working, and a per-window "device is
+    // delivering no signal" line accuses a healthy setup several times a
+    // minute. Only a test that saw signal in NO window at all says anything,
+    // and it leads with the gate as the likely explanation.
     let micTestPeak = 0;
     let micTestSum = 0;
     let micTestCount = 0;
     let micTestLastLogAt = 0;
+    let micTestSilentWindows = 0;
+    let micTestEverHadSignal = false;
+    let micTestWarned = false;
+    const SILENT_WINDOWS_BEFORE_WARNING = 4; // ~8 seconds of never once hearing anything
     const attachAudioTestListeners = (capture: MicrophoneCapture) => {
+      micTestSilentWindows = 0;
+      micTestEverHadSignal = false;
+      micTestWarned = false;
       capture.on('data', (chunk: Buffer) => {
         const level = computeRmsLevel(chunk);
         micTestPeak = Math.max(micTestPeak, level);
@@ -4919,11 +4945,28 @@ export class AppState {
         if (micTestLastLogAt === 0) micTestLastLogAt = now;
         if (now - micTestLastLogAt >= 2000) {
           const mean = micTestCount > 0 ? micTestSum / micTestCount : 0;
+          const silent = micTestPeak < 0.001;
+          if (silent) micTestSilentWindows++;
+          else { micTestEverHadSignal = true; micTestSilentWindows = 0; }
           console.log(
             `[AudioTest:mic] level peak=${micTestPeak.toFixed(4)} mean=${mean.toFixed(4)} ` +
-            `chunks=${micTestCount} bytes/chunk=${chunk.length} ` +
-            `${micTestPeak < 0.001 ? '— SILENT: the device opened but is delivering no signal' : ''}`,
+            `chunks=${micTestCount} bytes/chunk=${chunk.length}` +
+            (silent ? ' — quiet window (noise gate closed, or nobody speaking)' : ''),
           );
+          if (
+            silent &&
+            !micTestEverHadSignal &&
+            !micTestWarned &&
+            micTestSilentWindows >= SILENT_WINDOWS_BEFORE_WARNING
+          ) {
+            micTestWarned = true;
+            console.warn(
+              `[AudioTest:mic] no signal in ${micTestSilentWindows} consecutive windows since the ` +
+              `test started. If this device has AI noise suppression (SteelSeries Sonar / NVIDIA ` +
+              `Broadcast / Krisp) it emits digital silence until you speak — speak to confirm. ` +
+              `If speaking changes nothing, the device's routing or mute is upstream of this app.`,
+            );
+          }
           micTestPeak = 0; micTestSum = 0; micTestCount = 0; micTestLastLogAt = now;
         }
         const targets = broadcastTargets();

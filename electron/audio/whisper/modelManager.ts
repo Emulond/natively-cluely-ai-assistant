@@ -60,6 +60,30 @@ const MODEL_CATALOG: WhisperModelInfo[] = [
 export const MODEL_CATALOG_IDS: Set<string> = new Set(MODEL_CATALOG.map(m => m.id));
 
 /**
+ * Whether a catalogued checkpoint can transcribe anything but English.
+ *
+ * Picking a non-English recognition language while an English-only model is
+ * loaded is a silent dead end: Moonshine and the `.en` / Distil checkpoints
+ * have no multilingual decoder, so at best they transcribe the audio
+ * phonetically as English and at worst they refuse the request outright. The
+ * settings UI shows the distinction, but nothing in the logs did — so "I chose
+ * Russian and got English words back" looked like a transcription bug rather
+ * than a model that was never capable of Russian.
+ *
+ * Unknown ids return true: a checkpoint outside the catalog gets the benefit of
+ * the doubt rather than a wrong warning.
+ */
+export function isMultilingualModel(modelId: string): boolean {
+  const entry = MODEL_CATALOG.find(m => m.id === modelId);
+  return entry ? entry.multilingual !== false : true;
+}
+
+/** Catalogued multilingual model ids, for pointing the user at a usable one. */
+export function getMultilingualModelNames(): string[] {
+  return MODEL_CATALOG.filter(m => m.multilingual).map(m => m.name);
+}
+
+/**
  * Returns the directory where Whisper models are stored.
  * Uses electron app.getPath('userData') so models persist across updates.
  */

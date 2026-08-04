@@ -99,10 +99,22 @@ async function updatePromptCache(promptText: string): Promise<void> {
   }
 }
 
-// Distil-Whisper checkpoints have NO multilingual decoder. If the user picks
-// 'auto' or any non-English language, the worker will silently transcribe
-// non-English audio as phonetic English. Force language='english' so the
-// behaviour is at least documented and consistent.
+// English-only checkpoints have NO multilingual decoder, and transformers.js
+// refuses BOTH `language` and `task` for them:
+//
+//   Error: Cannot specify `task` or `language` for an English-only model.
+//     at _retrieve_init_tokens (transformers.node.mjs)
+//
+// It throws before a single audio frame is decoded, so every transcription
+// fails and the channel produces no text at all while the capture side looks
+// perfectly healthy. Observed on a packaged Windows build, three for three:
+//
+//   transcribe START  task=t1 lang=english model=Xenova/whisper-tiny.en
+//   transcribe FAILED task=t1: Cannot specify `task` or `language` ...
+//
+// So for these models we must send NEITHER option — not `language: 'english'`,
+// which is what the previous code did. They transcribe English unconditionally;
+// omitting both is exactly the behaviour we wanted anyway.
 const ENGLISH_ONLY_MODELS = new Set([
   // Moonshine — English-only by design
   'onnx-community/moonshine-tiny-ONNX',
@@ -118,6 +130,22 @@ const ENGLISH_ONLY_MODELS = new Set([
   'Xenova/whisper-small.en',
   'Xenova/whisper-medium.en',
 ]);
+
+// Checkpoints that proved English-only at runtime. The static list above cannot
+// know about a checkpoint added later, and being wrong about one costs the whole
+// session's transcript — so a refusal is recorded here and the next segment goes
+// out clean. Exactly one segment pays for the discovery instead of all of them.
+const englishOnlyAtRuntime = new Set<string>();
+
+// transformers.js decides this from `generation_config.is_multilingual`, so read
+// the same flag off the loaded model rather than guessing from the id.
+function isEnglishOnlyModel(id: string): boolean {
+  if (ENGLISH_ONLY_MODELS.has(id) || englishOnlyAtRuntime.has(id)) return true;
+  return pipe?.model?.generation_config?.is_multilingual === false;
+}
+
+const isEnglishOnlyRefusal = (e: any): boolean =>
+  /English-only model/i.test(String(e?.message ?? e ?? ''));
 
 if (!parentPort) throw new Error('whisperWorker must be run as a Worker thread');
 
@@ -488,13 +516,10 @@ parentPort.on('message', async (msg: any) => {
       let language: string | null = resolveWhisperLanguage(msg.language);
       const streaming: boolean = !!msg.streaming;
 
-      // English-only checkpoints (Distil-Whisper + .en variants) have no
-      // multilingual decoder. Force language='english' regardless of the
-      // user's auto/non-English setting so the model isn't asked to
-      // transcribe phonetically into the wrong language.
-      if (ENGLISH_ONLY_MODELS.has(loadedModelId)) {
-        language = 'english';
-      }
+      // English-only checkpoints reject `language` AND `task` outright — see
+      // ENGLISH_ONLY_MODELS. Drop the language here and the task below.
+      const englishOnly = isEnglishOnlyModel(loadedModelId);
+      if (englishOnly) language = null;
 
       // Streaming partial passes use deterministic settings so consecutive
       // overlapping windows are stable enough for LocalAgreement-2 to
@@ -525,6 +550,9 @@ parentPort.on('message', async (msg: any) => {
             no_speech_threshold: 0.6,
           };
       if (language) opts.language = language;
+      // `task` is refused alongside `language` on English-only checkpoints, and
+      // 'transcribe' is what they do anyway — there is nothing to select.
+      if (englishOnly) delete opts.task;
 
       // Use the pre-tokenized prompt cache populated by setPrompt messages.
       // Skip for Moonshine (cached IDs are null in that case anyway).
@@ -537,6 +565,13 @@ parentPort.on('message', async (msg: any) => {
       // is thrown, and the host only knows it dispatched audio that never came
       // back. The watchdog below converts that silence into a running elapsed
       // count, so a stuck inference is visibly stuck rather than merely absent.
+      //
+      // CAVEAT, measured: this timer does not always fire. A packaged Windows
+      // build ran whisper-large-v3-turbo for 65+ seconds on a 1.6s segment with
+      // no STILL RUNNING line at all — heavy ONNX inference starves this
+      // thread's timers, so the worker cannot report on itself while it is busy.
+      // The host's own watchdog (LocalWhisperSTT.armTaskWatchdog) is therefore
+      // the authoritative one; this is a best-effort extra.
       const samples = (msg.audio?.length ?? 0);
       const audioSec = (samples / 16000).toFixed(2);
       const t0 = Date.now();
@@ -555,7 +590,21 @@ parentPort.on('message', async (msg: any) => {
 
       let result: any;
       try {
-        result = await pipe(msg.audio, opts);
+        try {
+          result = await pipe(msg.audio, opts);
+        } catch (e: any) {
+          // A checkpoint we did not know was English-only. Record it so every
+          // later segment goes out clean, and retry this one immediately rather
+          // than reporting a failure the user can do nothing about.
+          if (!isEnglishOnlyRefusal(e)) throw e;
+          englishOnlyAtRuntime.add(loadedModelId);
+          delete opts.language;
+          delete opts.task;
+          console.warn(
+            `[WhisperWorker] ${loadedModelId} is English-only — dropping language/task and retrying task=${msg.taskId}`,
+          );
+          result = await pipe(msg.audio, opts);
+        }
       } finally {
         clearInterval(watchdog);
       }
