@@ -239,9 +239,25 @@ parentPort.on('message', async (msg: any) => {
       const useExternalDataFormat: boolean | Record<string, boolean> | undefined =
         msg.useExternalDataFormat;
       const loadT0 = Date.now();
-      pipe = await pipeline('automatic-speech-recognition', msg.modelId, {
+
+      // resolveInferenceConfig() asks for DirectML on Windows and CoreML on
+      // Apple Silicon, but that list was only ever assigned to
+      // env.backends.onnx.executionProviders — which transformers.js does not
+      // read. Execution provider selection goes through the `device` option on
+      // pipeline(). Without it every model silently ran on CPU, so the GPU path
+      // this app has always intended to use was inert: measured 6959ms to
+      // transcribe 0.81s of speech (realtimeFactor 8.59x) on whisper-small.
+      //
+      // Only pass devices transformers.js actually knows (DEVICE_TYPES). Notably
+      // 'coreml' is NOT one of them, so macOS keeps the previous behaviour of
+      // letting the library choose rather than being handed an invalid value.
+      const SUPPORTED_DEVICES = new Set(['cpu', 'dml', 'cuda', 'webgpu', 'gpu', 'auto']);
+      const preferredDevice = providers.find((p) => SUPPORTED_DEVICES.has(p));
+
+      const buildPipeline = (device?: string) => pipeline('automatic-speech-recognition', msg.modelId, {
         dtype,
         session_options: sessionOptions,
+        ...(device ? { device } : {}),
         ...(useExternalDataFormat !== undefined
           ? { use_external_data_format: useExternalDataFormat }
           : {}),
@@ -255,6 +271,22 @@ parentPort.on('message', async (msg: any) => {
           });
         },
       });
+
+      try {
+        console.log(`[WhisperWorker] building pipeline with device=${preferredDevice ?? '(library default)'}`);
+        pipe = await buildPipeline(preferredDevice);
+      } catch (deviceErr: any) {
+        // A GPU provider can fail for reasons entirely outside our control —
+        // no compatible adapter, a driver that rejects the graph, a DirectML
+        // version mismatch. Falling back to CPU keeps transcription working
+        // (slowly) instead of leaving the channel with no worker at all, which
+        // is silent from the user's side.
+        if (!preferredDevice || preferredDevice === 'cpu') throw deviceErr;
+        console.warn(
+          `[WhisperWorker] device=${preferredDevice} failed to initialise (${deviceErr?.message ?? deviceErr}) — falling back to CPU`,
+        );
+        pipe = await buildPipeline('cpu');
+      }
       loadedModelId = msg.modelId;
 
       // What actually got built. pipeline() is called WITHOUT a `device`
@@ -280,6 +312,7 @@ parentPort.on('message', async (msg: any) => {
         }
         console.log('[WhisperWorker][diag:session] ' + JSON.stringify({
           modelClass: model?.constructor?.name ?? 'unknown',
+          deviceUsed: preferredDevice ?? '(library default)',
           sessions: sessionNames,
           executionProviders: epsBySession,
           requestedProviders: providers,
