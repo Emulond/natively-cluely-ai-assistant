@@ -121,6 +121,30 @@ const ENGLISH_ONLY_MODELS = new Set([
 
 if (!parentPort) throw new Error('whisperWorker must be run as a Worker thread');
 
+// Forward this worker's console output to the host so it lands in
+// natively_debug.log. A worker_thread's stdout is NOT piped into the main
+// process log, so everything this file reports — model load progress, ONNX
+// provider selection, decode errors — was invisible in user logs. That blind
+// spot is precisely where "audio dispatched, no transcript" failures live:
+// the host can see that it POSTED a transcribe and got nothing back, but not
+// why. Best-effort and non-fatal: a failed post must never break inference.
+for (const level of ['log', 'warn', 'error'] as const) {
+  const original = console[level].bind(console);
+  console[level] = (...args: unknown[]) => {
+    original(...args);
+    try {
+      const message = args
+        .map((a) => {
+          if (typeof a === 'string') return a;
+          if (a instanceof Error) return a.stack ?? a.message;
+          try { return JSON.stringify(a); } catch { return String(a); }
+        })
+        .join(' ');
+      parentPort!.postMessage({ type: 'log', level, message });
+    } catch { /* forwarding is best-effort — never break the worker over a log */ }
+  };
+}
+
 // Loads @huggingface/transformers via a real dynamic import() at runtime.
 // Using new Function prevents TypeScript from rewriting import() → require()
 // in the CommonJS output, which would fail because the package is ESM-only.

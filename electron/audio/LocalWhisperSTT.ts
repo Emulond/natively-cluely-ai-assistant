@@ -36,12 +36,12 @@ import { Worker } from 'worker_threads';
 import { resampleToF32 } from './whisper/audioResampler';
 import { VadProcessor } from './whisper/vadProcessor';
 import { filterHallucination } from './whisper/hallucinationFilter';
-import { configureTransformersCache } from './whisper/modelManager';
+import { configureTransformersCache, getModelSizeBytes } from './whisper/modelManager';
 import { clearLoadSentinel, modelPreloader, writeLoadSentinel } from './whisper/modelPreloader';
 import { buildWorkerInitMessage } from './whisper/inferenceConfig';
 import { resolveWhisperWorkerPath } from './whisper/workerPathResolver';
 import type { WorkerOutMessage } from './whisper/types';
-import { acquireOnnxSlot, hasEnoughMemoryForOnnxSession, getMinFreeGBForOnnxSession } from '../utils/onnxThreadConfig';
+import { acquireOnnxSlot, hasEnoughMemoryForOnnxSession, getMinFreeGBForOnnxSession, getAvailableMemoryGB } from '../utils/onnxThreadConfig';
 
 export class LocalWhisperSTT extends EventEmitter {
     private readonly modelId: string;
@@ -143,6 +143,24 @@ export class LocalWhisperSTT extends EventEmitter {
     // the slot promptly. Whisper uses priority 'high' so its streaming loop
     // acquires before queued normal-priority consumers.
     private slotRelease: (() => void) | null = null;
+
+    // Count of Whisper workers alive in THIS process. worker_threads share the
+    // process heap, so this is the number of full model copies resident —
+    // the quantity the second-session admission check above reasons about.
+    private static liveWorkers = 0;
+    private countedLive = false;
+
+    private markWorkerLive(): void {
+        if (this.countedLive) return;
+        this.countedLive = true;
+        LocalWhisperSTT.liveWorkers++;
+    }
+
+    private markWorkerGone(): void {
+        if (!this.countedLive) return;
+        this.countedLive = false;
+        LocalWhisperSTT.liveWorkers = Math.max(0, LocalWhisperSTT.liveWorkers - 1);
+    }
     private taskCounter = 0;
     private workerReady = false;
     private isDrainingFinals = false;
@@ -687,6 +705,7 @@ export class LocalWhisperSTT extends EventEmitter {
         if (warm) {
             console.log(`[LocalWhisperSTT] Using preloaded warm worker for ${this.modelId}`);
             this.worker = warm;
+            this.markWorkerLive();
             this.workerReady = true;
             // Inherit the slot release the preloader acquired. Both preloader
             // and our local listeners will call this — it's a no-op the
@@ -707,12 +726,46 @@ export class LocalWhisperSTT extends EventEmitter {
             );
         }
 
+        // A SECOND concurrent session is a second FULL copy of the model in
+        // this process — worker_threads share the process heap, so mic +
+        // system audio means 2x the weights resident, not a shared cache.
+        //
+        // The flat floor above cannot catch this: it is checked BEFORE the
+        // load, when memory still looks fine, and the exhaustion happens
+        // DURING the load. Observed on a 16GB Windows machine with
+        // whisper-large-v3-turbo: RSS climbed to 7.9GB with 811MB free, the
+        // second worker never reached `ready`, and — because both workers
+        // share the process — the FIRST (already-loaded, healthy) worker could
+        // no longer complete an inference either. Result: audio dispatched,
+        // never transcribed, no error anywhere.
+        //
+        // So an additional session must be admitted against the footprint it
+        // will actually add. ONNX resident size runs well above the on-disk
+        // size (fp32 weights plus arenas); 2x is a deliberately conservative
+        // estimate — under-admitting costs one channel, over-admitting costs
+        // BOTH channels plus responsiveness.
+        if (LocalWhisperSTT.liveWorkers > 0) {
+            const modelGB = (getModelSizeBytes(this.modelId) || 0) / 1024 ** 3;
+            const requiredGB = getMinFreeGBForOnnxSession() + modelGB * 2;
+            const availableGB = getAvailableMemoryGB();
+            if (modelGB > 0 && availableGB < requiredGB) {
+                throw new Error(
+                    `[LocalWhisperSTT] refusing a 2nd concurrent Whisper session for ${this.modelId}: ` +
+                    `available=${availableGB.toFixed(1)}GB < required=${requiredGB.toFixed(1)}GB ` +
+                    `(model=${modelGB.toFixed(1)}GB x2 + ${getMinFreeGBForOnnxSession()}GB floor). ` +
+                    `Loading it would stall this channel AND the one already running. ` +
+                    `Pick a smaller local model, or set per-channel models in Settings.`,
+                );
+            }
+        }
+
         this.slotRelease = await acquireOnnxSlot('high');
 
         console.log(`[LocalWhisperSTT] Cold-starting worker for ${this.modelId}`);
         const workerPath = resolveWhisperWorkerPath();
         writeLoadSentinel(this.modelId);
         this.worker = new Worker(workerPath);
+        this.markWorkerLive();
         this.attachWorkerListeners();
         this.worker.postMessage(buildWorkerInitMessage(this.modelId));
     }
@@ -721,6 +774,19 @@ export class LocalWhisperSTT extends EventEmitter {
         if (!this.worker) return;
 
         this.worker.on('message', (msg: WorkerOutMessage) => {
+            // Handled before every other branch — including the isActive gate
+            // below — because the most valuable worker logs are the ones from a
+            // worker that is loading, stuck, or dying, i.e. exactly when this
+            // instance is not yet (or no longer) active.
+            if ((msg as { type?: string }).type === 'log') {
+                const m = msg as unknown as { level?: string; message?: string };
+                const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+                const line = `[WhisperWorker${tag}] ${m.message ?? ''}`;
+                if (m.level === 'error') console.error(line);
+                else if (m.level === 'warn') console.warn(line);
+                else console.log(line);
+                return;
+            }
             if (msg.type === 'ready') {
                 clearLoadSentinel(this.modelId);
                 this.workerReady = true;
@@ -803,6 +869,7 @@ export class LocalWhisperSTT extends EventEmitter {
             this.streamingTaskId = null;
             // Free the shared ONNX gate slot — Whisper's session is gone.
             if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
+            this.markWorkerGone();
             this.workerReady = false;
             // Symmetric with the exit handler below: a worker `error` is
             // followed by a non-zero `exit` in node:worker_threads, so the
@@ -835,6 +902,7 @@ export class LocalWhisperSTT extends EventEmitter {
             modelPreloader.recordLoadFailure(this.modelId);
             this.clearStreamingWatchdog();
             if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
+            this.markWorkerGone();
             const hadInFlight = this.streamingTaskInFlight;
             this.streamingTaskInFlight = false;
             this.streamingTaskId = null;
@@ -867,6 +935,7 @@ export class LocalWhisperSTT extends EventEmitter {
         // Free the shared ONNX gate slot on clean shutdown — the session's
         // BFCArena is being torn down with the worker, so the slot can go.
         if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
+            this.markWorkerGone();
         // Reset the sent-prompt tracker: a future spawnWorker call will get a
         // fresh worker with empty cache, so we must re-push on next ready.
         this.contextPromptSentToWorker = '';

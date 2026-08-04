@@ -202,6 +202,17 @@ class ModelPreloader {
         w.on('error', () => { (w as any).__slotRelease?.(); });
 
         w.on('message', (msg: any) => {
+            // The preloader owns the worker for the whole model load, so this
+            // is where load progress and load failures surface. Without this
+            // branch those lines are dropped and a worker that never reaches
+            // 'ready' looks silent from the host side.
+            if (msg.type === 'log') {
+                const line = `[WhisperWorker:preload] ${msg.message ?? ''}`;
+                if (msg.level === 'error') console.error(line);
+                else if (msg.level === 'warn') console.warn(line);
+                else console.log(line);
+                return;
+            }
             if (msg.type === 'ready') {
                 clearLoadSentinel(modelId);
                 console.log(`[ModelPreloader] Worker warm for ${modelId}`);
