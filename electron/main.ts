@@ -5826,9 +5826,14 @@ export class AppState {
     const { CredentialsManager } = require('./services/CredentialsManager');
     CredentialsManager.getInstance().setSttLanguage(key);
 
-    // 'auto' is only meaningful for NativelyProSTT — other providers fall back to en-US.
+    // 'auto' is meaningful for NativelyProSTT (the relay detects the language)
+    // and for local Whisper (multilingual checkpoints detect it themselves when
+    // no language is forced). Every other provider needs a concrete language, so
+    // they still fall back to en-US. Rewriting 'auto' for local-whisper forced
+    // English decoding, which transcribed non-English speech phonetically.
     const sttProvider = CredentialsManager.getInstance().getSttProvider();
-    const effectiveKey = (key === 'auto' && sttProvider !== 'natively') ? 'english-us' : key;
+    const detectsLanguageItself = sttProvider === 'natively' || sttProvider === 'local-whisper';
+    const effectiveKey = (key === 'auto' && !detectsLanguageItself) ? 'english-us' : key;
 
     this.googleSTT?.setRecognitionLanguage(effectiveKey);
     this.googleSTT_User?.setRecognitionLanguage(effectiveKey);
