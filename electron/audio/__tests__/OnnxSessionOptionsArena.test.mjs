@@ -65,7 +65,7 @@ test('arena/mem-pattern default is platform-aware (off on darwin, on elsewhere)'
     // coverage lives in utils/__tests__/OnnxThreadDefaults.test.mjs.
     const expectedIntra = process.platform === 'darwin'
       ? 1
-      : Math.max(1, Math.min(4, Math.floor((os.cpus()?.length ?? 1) / 2)));
+      : Math.max(1, Math.min(8, (os.cpus()?.length ?? 1) - 2));
     assert.equal(opts.intraOpNumThreads, expectedIntra);
     assert.equal(opts.interOpNumThreads, 1);
     assert.equal(opts.executionMode, 'sequential');

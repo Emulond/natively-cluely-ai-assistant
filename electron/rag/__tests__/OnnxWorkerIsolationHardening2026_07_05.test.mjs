@@ -175,7 +175,7 @@ describe('getBoundedOnnxSessionOptions', () => {
 function expectedIntraOpDefault() {
   if (process.platform === 'darwin') return 1;
   const cores = os.cpus()?.length ?? 1;
-  return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+  return Math.max(1, Math.min(8, cores - 2));
 }
 
   const modPath = path.resolve(repoRoot, 'dist-electron/electron/utils/onnxThreadConfig.js');

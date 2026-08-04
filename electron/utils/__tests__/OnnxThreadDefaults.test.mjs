@@ -44,11 +44,12 @@ describe('ONNX session thread defaults', () => {
     const cores = os.cpus()?.length ?? 1;
     const opts = getBoundedOnnxSessionOptions();
 
-    const expected = Math.max(1, Math.min(4, Math.floor(cores / 2)));
+    // Leave 2 threads for UI/audio/Electron, take the rest, capped at 8.
+    const expected = Math.max(1, Math.min(8, cores - 2));
     assert.equal(
       opts.intraOpNumThreads,
       expected,
-      `expected half of ${cores} cores capped at 4`,
+      `expected ${cores} cores minus 2, capped at 8`,
     );
 
     // The point of the fix: on any multi-core machine this must exceed 1.
@@ -60,12 +61,12 @@ describe('ONNX session thread defaults', () => {
     }
   });
 
-  test('stays bounded — never exceeds 4 threads however many cores exist', async () => {
+  test('stays bounded — never exceeds 8 threads however many cores exist', async () => {
     const { getBoundedOnnxSessionOptions } = await import(MODULE_URL);
     const opts = getBoundedOnnxSessionOptions();
     assert.ok(
-      opts.intraOpNumThreads >= 1 && opts.intraOpNumThreads <= 4,
-      `intraOpNumThreads must stay within 1..4, got ${opts.intraOpNumThreads}`,
+      opts.intraOpNumThreads >= 1 && opts.intraOpNumThreads <= 8,
+      `intraOpNumThreads must stay within 1..8, got ${opts.intraOpNumThreads}`,
     );
   });
 

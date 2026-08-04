@@ -127,7 +127,16 @@ function defaultArenaEnabled(): boolean {
 function defaultIntraOpThreads(): number {
     if (process.platform === 'darwin') return 1;
     const cores = os.cpus?.()?.length ?? 1;
-    return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+    // Speech transcription is the latency-critical foreground task on this
+    // machine — there is nothing to save the cores for. The earlier half-cores
+    // cap was cautious to the point of being the bottleneck: on a 12-thread
+    // i5-11260H it used 4.
+    //
+    // Leave 2 threads for the UI, audio capture and the rest of Electron, and
+    // take the rest. Capped at 8: past that, ONNX's own coordination overhead
+    // starts eating the gain on a consumer CPU, and two channels can be live at
+    // once (mic + system audio), each with its own session.
+    return Math.max(1, Math.min(8, cores - 2));
 }
 
 export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {

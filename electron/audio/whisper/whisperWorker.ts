@@ -300,26 +300,64 @@ parentPort.on('message', async (msg: any) => {
         try { if (_gpuFs.existsSync(gpuSentinelPath)) _gpuFs.unlinkSync(gpuSentinelPath); } catch { /* best-effort */ }
       };
 
-      let useGpu = GPU_DEVICES.has(requestedDevice);
-      if (requestedDevice && !useGpu && requestedDevice !== 'cpu') {
-        console.warn(`[WhisperWorker] NATIVELY_ONNX_DEVICE="${requestedDevice}" is not a supported GPU device — using CPU`);
+      // AUTOMATIC GPU LADDER. Requiring a user to set environment variables to
+      // get their GPU used is not a fix, so this now configures itself.
+      //
+      // Adapter order cannot be queried from Node, but on a laptop the discrete
+      // GPU is conventionally adapter 1 and the integrated one adapter 0 — and
+      // the integrated GPU is what crashed when DirectML defaulted to adapter 0.
+      // So the ladder tries the discrete GPU first, then the integrated one,
+      // then CPU, recording each attempt so a failure is never repeated:
+      //
+      //   attempt 1 → dml deviceId=1   (discrete GPU, e.g. a laptop NVIDIA)
+      //   attempt 2 → dml deviceId=0   (integrated GPU)
+      //   attempt 3 → CPU              (always works, never retried past here)
+      //
+      // The sentinel is written BEFORE each attempt and cleared on success, so a
+      // native abort — which no JS catch can intercept — is still recorded. The
+      // next launch reads it and moves down the ladder. A machine that hates
+      // DirectML costs at most two startups before settling permanently on CPU.
+      //
+      // NATIVELY_ONNX_DEVICE=cpu opts out entirely; NATIVELY_ONNX_DEVICE=dml
+      // plus NATIVELY_ONNX_DEVICE_ID=N pins a specific adapter.
+      const isWindows = process.platform === 'win32';
+      let chosenDevice: string | undefined;
+      let chosenDeviceId: number | undefined;
+
+      if (requestedDevice === 'cpu') {
+        console.log('[WhisperWorker] GPU disabled by NATIVELY_ONNX_DEVICE=cpu');
+      } else if (GPU_DEVICES.has(requestedDevice)) {
+        chosenDevice = requestedDevice;
+        chosenDeviceId = deviceId;
+      } else if (isWindows) {
+        chosenDevice = 'dml';
+        chosenDeviceId = deviceId ?? 1; // discrete GPU first
       }
-      if (useGpu) {
+
+      if (chosenDevice) {
         const poisoned = readGpuSentinel();
         if (poisoned) {
-          console.warn(
-            `[WhisperWorker] SKIPPING GPU (${requestedDevice}): a previous attempt did not survive initialisation ` +
-            `(${JSON.stringify(poisoned)}). Staying on CPU. Delete ${gpuSentinelPath} to try again.`,
-          );
-          useGpu = false;
+          const failedId = typeof poisoned.deviceId === 'number' ? poisoned.deviceId : undefined;
+          if (deviceId !== undefined) {
+            // An explicit pin already failed — respect it and stop.
+            console.warn(`[WhisperWorker] SKIPPING GPU: pinned device ${chosenDevice}:${deviceId} previously failed to initialise. Using CPU.`);
+            chosenDevice = undefined;
+          } else if (failedId === 1) {
+            console.warn('[WhisperWorker] GPU adapter 1 previously failed to initialise — trying adapter 0 (integrated).');
+            chosenDeviceId = 0;
+          } else {
+            console.warn(`[WhisperWorker] GPU previously failed to initialise (${JSON.stringify(poisoned)}) — using CPU. Delete ${gpuSentinelPath} to retry.`);
+            chosenDevice = undefined;
+          }
         }
       }
 
       // Our own EP list wins over transformers.js's, per the ??= above.
-      const gpuExecutionProviders = useGpu
-        ? [deviceId !== undefined ? { name: requestedDevice, deviceId } : { name: requestedDevice }, 'cpu']
+      const gpuExecutionProviders = chosenDevice
+        ? [chosenDeviceId !== undefined ? { name: chosenDevice, deviceId: chosenDeviceId } : { name: chosenDevice }, 'cpu']
         : undefined;
-      const preferredDevice = useGpu ? requestedDevice : undefined;
+      const preferredDevice = chosenDevice;
+      const deviceIdInUse = chosenDeviceId;
 
       const buildPipeline = (device?: string) => pipeline('automatic-speech-recognition', msg.modelId, {
         dtype,
@@ -343,9 +381,9 @@ parentPort.on('message', async (msg: any) => {
 
       try {
         if (preferredDevice) {
-          writeGpuSentinel({ device: preferredDevice, deviceId: deviceId ?? 'default', modelId: msg.modelId, at: Date.now() });
+          writeGpuSentinel({ device: preferredDevice, deviceId: deviceIdInUse ?? 'default', modelId: msg.modelId, at: Date.now() });
           console.log(
-            `[WhisperWorker] building pipeline with device=${preferredDevice} deviceId=${deviceId ?? '(ORT default)'}` +
+            `[WhisperWorker] building pipeline with device=${preferredDevice} deviceId=${deviceIdInUse ?? '(ORT default)'}` +
             ` providers=${JSON.stringify(gpuExecutionProviders)}`,
           );
         } else {
@@ -394,7 +432,7 @@ parentPort.on('message', async (msg: any) => {
         }
         console.log('[WhisperWorker][diag:session] ' + JSON.stringify({
           modelClass: model?.constructor?.name ?? 'unknown',
-          deviceUsed: preferredDevice ?? '(library default)',
+          deviceUsed: preferredDevice ? `${preferredDevice}:${deviceIdInUse ?? 'default'}` : 'cpu (library default)',
           sessions: sessionNames,
           executionProviders: epsBySession,
           requestedProviders: providers,
