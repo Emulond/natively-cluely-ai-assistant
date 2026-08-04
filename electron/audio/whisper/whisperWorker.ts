@@ -17,24 +17,22 @@
 import { parentPort } from 'worker_threads';
 import { WhisperProgressAggregator } from './whisperProgressAggregator';
 import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
+import { RECOGNITION_LANGUAGES } from '../../config/languages';
 
-const LANG_MAP: Record<string, string | null> = {
-  'auto': null,
-  'en-US': 'english',
-  'en-GB': 'english',
-  'fr-FR': 'french',
-  'de-DE': 'german',
-  'es-ES': 'spanish',
-  'ja-JP': 'japanese',
-  'ko-KR': 'korean',
-  'zh-CN': 'chinese',
-  'zh-TW': 'chinese',
-  'pt-BR': 'portuguese',
-  'it-IT': 'italian',
-  'ru-RU': 'russian',
-  'ar': 'arabic',
-  'hi-IN': 'hindi',
-};
+// The host sends the shared RECOGNITION_LANGUAGES key ('russian', 'english-us',
+// 'auto') — the same value every other STT provider receives — NOT a BCP-47 tag.
+// This used to be a hand-rolled BCP-47-keyed table, so every selection missed it
+// and fell through to null: picking Russian transcribed Russian speech as English.
+// Resolve through the shared config instead, reading iso639 (Whisper's language
+// tokens are ISO-639-1) like OpenAI/Groq/Deepgram/ElevenLabs/Soniox already do.
+// That also covers all ~35 configured languages rather than a stale subset of 15.
+//
+// 'auto' (and an unknown key) resolves to null, which leaves the language
+// unforced so a multilingual checkpoint runs its own detection.
+function resolveWhisperLanguage(key: string): string | null {
+  if (!key || key === 'auto') return null;
+  return RECOGNITION_LANGUAGES[key]?.iso639 ?? null;
+}
 
 let pipe: any = null;
 let loadedModelId = '';
@@ -265,7 +263,7 @@ parentPort.on('message', async (msg: any) => {
       return;
     }
     try {
-      let language: string | null = LANG_MAP[msg.language] ?? null;
+      let language: string | null = resolveWhisperLanguage(msg.language);
       const streaming: boolean = !!msg.streaming;
 
       // English-only checkpoints (Distil-Whisper + .en variants) have no
