@@ -251,29 +251,81 @@ parentPort.on('message', async (msg: any) => {
       // Only pass devices transformers.js actually knows (DEVICE_TYPES). Notably
       // 'coreml' is NOT one of them, so macOS keeps the previous behaviour of
       // letting the library choose rather than being handed an invalid value.
-      // GPU devices are OPT-IN, never derived from resolveInferenceConfig().
+      // ── GPU acceleration ────────────────────────────────────────────────
       //
-      // Passing device='dml' (the provider Windows asks for) killed the app at
-      // startup: the log ends immediately after "building pipeline with
-      // device=dml", with no 'model READY' and no fallback line. DirectML
-      // failing to initialise aborts the PROCESS — it is a native crash, not a
-      // JS throw — so the try/catch below cannot rescue it. A GPU provider that
-      // takes the whole app down with it is strictly worse than slow CPU
-      // inference, so it cannot be the default.
+      // onnxruntime-node ships CPU + DirectML on win32; CUDA is Linux-only in
+      // that binding, so DirectML is the only GPU path on Windows regardless of
+      // GPU vendor. DirectML runs over DX12 and drives NVIDIA/AMD/Intel alike.
       //
-      // Set NATIVELY_ONNX_DEVICE=dml (or cuda/webgpu) to opt in on a machine
-      // where it is known to work. Unset, transformers.js picks its own Node
-      // default, which is the behaviour that has always shipped.
-      const SUPPORTED_DEVICES = new Set(['cpu', 'dml', 'cuda', 'webgpu', 'gpu', 'auto']);
+      // WHICH ADAPTER MATTERS. On a laptop, DirectML's default adapter 0 is
+      // typically the integrated GPU, which shares system RAM — handing it a
+      // 352MB fp32 encoder is how the earlier device='dml' attempt took the
+      // whole app down at startup (native abort during init: no JS throw, so a
+      // try/catch cannot rescue it). A discrete GPU with its own VRAM is a very
+      // different proposition. ORT's DmlExecutionProviderOption accepts
+      // `deviceId`, so the adapter is selectable — set NATIVELY_ONNX_DEVICE_ID.
+      //
+      // HOW THIS REACHES ORT. Passing transformers.js a `device` string gives no
+      // way to specify deviceId. But it assigns its own provider list with
+      //     session_options.executionProviders ??= executionProviders;
+      // — `??=`, so a list we supply is preserved. We therefore build the EP
+      // list ourselves and pass it through session_options, with 'cpu' appended
+      // so ORT falls back per-operator for anything DirectML cannot run.
+      //
+      // CRASH SAFETY. A GPU init that aborts the process would otherwise make
+      // the app unopenable forever. Before attempting one we drop a sentinel
+      // file and clear it once the model is loaded; finding a stale sentinel at
+      // startup means the previous attempt never survived, so we stay on CPU and
+      // say so. Worst case is a single crash, then permanent automatic fallback.
+      // This mirrors the writeLoadSentinel/consumePoisonedOnnxLoad pattern used
+      // for model loads elsewhere in this codebase.
+      const GPU_DEVICES = new Set(['dml', 'cuda', 'webgpu']);
       const requestedDevice = (process.env.NATIVELY_ONNX_DEVICE ?? '').trim().toLowerCase();
-      const preferredDevice = SUPPORTED_DEVICES.has(requestedDevice) ? requestedDevice : undefined;
-      if (requestedDevice && !preferredDevice) {
-        console.warn(`[WhisperWorker] NATIVELY_ONNX_DEVICE="${requestedDevice}" is not a device transformers.js accepts — ignoring`);
+      const deviceIdRaw = Number.parseInt(process.env.NATIVELY_ONNX_DEVICE_ID ?? '', 10);
+      const deviceId = Number.isInteger(deviceIdRaw) && deviceIdRaw >= 0 ? deviceIdRaw : undefined;
+
+      const _gpuFs = require('fs');
+      const _gpuPath = require('path');
+      const gpuSentinelPath = _gpuPath.join(msg.cacheDir ?? '.', '.gpu-init-sentinel.json');
+      const readGpuSentinel = (): any | null => {
+        try {
+          if (!_gpuFs.existsSync(gpuSentinelPath)) return null;
+          return JSON.parse(_gpuFs.readFileSync(gpuSentinelPath, 'utf8'));
+        } catch { return null; }
+      };
+      const writeGpuSentinel = (info: unknown): void => {
+        try { _gpuFs.writeFileSync(gpuSentinelPath, JSON.stringify(info)); } catch { /* best-effort */ }
+      };
+      const clearGpuSentinel = (): void => {
+        try { if (_gpuFs.existsSync(gpuSentinelPath)) _gpuFs.unlinkSync(gpuSentinelPath); } catch { /* best-effort */ }
+      };
+
+      let useGpu = GPU_DEVICES.has(requestedDevice);
+      if (requestedDevice && !useGpu && requestedDevice !== 'cpu') {
+        console.warn(`[WhisperWorker] NATIVELY_ONNX_DEVICE="${requestedDevice}" is not a supported GPU device — using CPU`);
       }
+      if (useGpu) {
+        const poisoned = readGpuSentinel();
+        if (poisoned) {
+          console.warn(
+            `[WhisperWorker] SKIPPING GPU (${requestedDevice}): a previous attempt did not survive initialisation ` +
+            `(${JSON.stringify(poisoned)}). Staying on CPU. Delete ${gpuSentinelPath} to try again.`,
+          );
+          useGpu = false;
+        }
+      }
+
+      // Our own EP list wins over transformers.js's, per the ??= above.
+      const gpuExecutionProviders = useGpu
+        ? [deviceId !== undefined ? { name: requestedDevice, deviceId } : { name: requestedDevice }, 'cpu']
+        : undefined;
+      const preferredDevice = useGpu ? requestedDevice : undefined;
 
       const buildPipeline = (device?: string) => pipeline('automatic-speech-recognition', msg.modelId, {
         dtype,
-        session_options: sessionOptions,
+        session_options: device && gpuExecutionProviders
+          ? { ...sessionOptions, executionProviders: gpuExecutionProviders }
+          : sessionOptions,
         ...(device ? { device } : {}),
         ...(useExternalDataFormat !== undefined
           ? { use_external_data_format: useExternalDataFormat }
@@ -290,19 +342,32 @@ parentPort.on('message', async (msg: any) => {
       });
 
       try {
-        console.log(`[WhisperWorker] building pipeline with device=${preferredDevice ?? '(library default)'}`);
+        if (preferredDevice) {
+          writeGpuSentinel({ device: preferredDevice, deviceId: deviceId ?? 'default', modelId: msg.modelId, at: Date.now() });
+          console.log(
+            `[WhisperWorker] building pipeline with device=${preferredDevice} deviceId=${deviceId ?? '(ORT default)'}` +
+            ` providers=${JSON.stringify(gpuExecutionProviders)}`,
+          );
+        } else {
+          console.log('[WhisperWorker] building pipeline on CPU (library default device)');
+        }
         pipe = await buildPipeline(preferredDevice);
+        // Survived initialisation — this configuration is safe to retry.
+        clearGpuSentinel();
       } catch (deviceErr: any) {
         // A GPU provider can fail for reasons entirely outside our control —
         // no compatible adapter, a driver that rejects the graph, a DirectML
         // version mismatch. Falling back to CPU keeps transcription working
         // (slowly) instead of leaving the channel with no worker at all, which
         // is silent from the user's side.
-        if (!preferredDevice || preferredDevice === 'cpu') throw deviceErr;
+        if (!preferredDevice || preferredDevice === 'cpu') { clearGpuSentinel(); throw deviceErr; }
+        // A clean JS throw (as opposed to a native abort) is recoverable — but
+        // keep the sentinel so the next launch does not retry a device that
+        // already failed here.
         console.warn(
           `[WhisperWorker] device=${preferredDevice} failed to initialise (${deviceErr?.message ?? deviceErr}) — falling back to CPU`,
         );
-        pipe = await buildPipeline('cpu');
+        pipe = await buildPipeline(undefined);
       }
       loadedModelId = msg.modelId;
 
