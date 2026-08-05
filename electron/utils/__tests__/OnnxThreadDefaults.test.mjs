@@ -44,12 +44,15 @@ describe('ONNX session thread defaults', () => {
     const cores = os.cpus()?.length ?? 1;
     const opts = getBoundedOnnxSessionOptions();
 
-    // Leave 2 threads for UI/audio/Electron, take the rest, capped at 8.
-    const expected = Math.max(1, cores - 2);
+    // Leave 2 logical processors for UI/audio/Electron, then SPLIT what remains
+    // across the two concurrent Whisper sessions (mic + system audio) rather
+    // than handing the full budget to each. Floor of 2 on any multi-core box.
+    const budget = Math.max(1, cores - 2);
+    const expected = Math.max(cores > 2 ? 2 : 1, Math.floor(budget / 2));
     assert.equal(
       opts.intraOpNumThreads,
       expected,
-      `expected ${cores} cores minus 2, capped at 8`,
+      `expected (${cores} cores - 2) split across 2 channels, min 2`,
     );
 
     // The point of the fix: on any multi-core machine this must exceed 1.
@@ -58,6 +61,30 @@ describe('ONNX session thread defaults', () => {
         opts.intraOpNumThreads > 1,
         'multi-core machines must not run Whisper inference single-threaded',
       );
+    }
+  });
+
+  test('two concurrent channels cannot oversubscribe the machine', async () => {
+    // THE BUG: each channel took `cores - 2` for itself. On a 6-core/12-thread
+    // i5-11260H that is 10 threads twice over — 20 threads on 12 logical
+    // processors, with the OS preempting ONNX's spin-waits. Measured on that
+    // machine, whisper-tiny.en (39MB) needed 2.9s for 1.89s of speech while
+    // large-v3-turbo ran beside it. Tiny should beat real time many times over.
+    //
+    // Asserted against a synthetic 12-core machine so the check does not depend
+    // on whatever the test runner happens to have.
+    const { getBoundedOnnxSessionOptions } = await import(MODULE_URL);
+    const realCpus = os.cpus;
+    os.cpus = () => new Array(12).fill({ model: 'synthetic', speed: 0 });
+    try {
+      const perChannel = getBoundedOnnxSessionOptions().intraOpNumThreads;
+      assert.ok(
+        perChannel * 2 <= 12,
+        `two channels at ${perChannel} threads each would oversubscribe a 12-thread CPU`,
+      );
+      assert.ok(perChannel >= 2, 'a channel must still get real parallelism');
+    } finally {
+      os.cpus = realCpus;
     }
   });
 

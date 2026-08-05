@@ -7788,7 +7788,11 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('stop-audio-test', async () => {
-    await appState.stopAudioTest();
+    // Await the native teardown, not just its scheduling. The renderer sends
+    // start immediately after stop when the meter scrolls back into view, and
+    // resolving early lets the next start reopen the device while the previous
+    // stream is still being torn down — a native fault, not an exception.
+    await appState.stopAudioTestAndAwaitTeardown();
     return { success: true };
   });
 

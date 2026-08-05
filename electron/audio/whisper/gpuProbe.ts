@@ -123,6 +123,14 @@ export function findSmallestCachedOnnx(modelsDir: string): string | null {
             const full = path.join(dir, entry.name);
             if (entry.isDirectory()) { walk(full, depth + 1); continue; }
             if (!entry.name.endsWith('.onnx')) continue;
+            // ENCODERS ONLY, and only fp32 ones.
+            //
+            // A decoder is the wrong thing to probe with. Whisper decoders ship
+            // quantised (q8), and DirectML's int8 operator coverage is patchy —
+            // a refusal there says nothing about whether the adapter works, but
+            // it looks identical to one that does. Encoders are dense fp32,
+            // which is DirectML's home ground.
+            if (!/^encoder_model(_fp32|_fp16)?\.onnx$/i.test(entry.name)) continue;
             try {
                 const { size } = fs.statSync(full);
                 // Skip external-data stubs: a few hundred KB of graph whose
@@ -130,6 +138,7 @@ export function findSmallestCachedOnnx(modelsDir: string): string | null {
                 // companion fails for reasons that have nothing to do with the
                 // GPU, which would poison the verdict.
                 if (size < 1_000_000) continue;
+                if (fs.existsSync(`${full}_data`)) continue;
                 if (!best || size < best.size) best = { file: full, size };
             } catch { /* unreadable — skip */ }
         }
@@ -138,7 +147,7 @@ export function findSmallestCachedOnnx(modelsDir: string): string | null {
     return best ? (best as { file: string }).file : null;
 }
 
-function runProbeChild(onnxPath: string, deviceId: number): Promise<{ ok: boolean; ms?: number; error?: string }> {
+function runProbeChild(onnxPath: string, deviceId: number | 'cpu'): Promise<{ ok: boolean; ms?: number; error?: string }> {
     return new Promise((resolve) => {
         const script = resolveGpuProbeChildPath();
         if (!fs.existsSync(script)) {
@@ -287,8 +296,33 @@ export async function resolveGpuDevice(opts: {
         return cpu('no downloaded model to probe with — staying on CPU until one exists');
     }
 
+    // CONTROL RUN FIRST. Opening this file on the CPU must succeed, or nothing
+    // learned from the GPU runs means anything: a corrupt download, a missing
+    // external-data companion or an unloadable native binding all produce dead
+    // children that look exactly like "DirectML is unavailable". Blaming the GPU
+    // for those would cache a wrong verdict against the driver version and keep
+    // it until the next driver update.
+    const control = await runProbeChild(onnxPath, 'cpu');
+    if (!control.ok) {
+        const result: GpuProbeResult = {
+            deviceId: null,
+            reason:
+                `probe model ${path.basename(onnxPath)} could not be opened on the CPU either ` +
+                `(${control.error ?? 'unknown'}) — this is not a GPU problem, so no adapter was blamed`,
+            signature,
+            probedAt: Date.now(),
+            attempts: [{ deviceId: -1, ok: false, error: control.error }],
+        };
+        // Deliberately NOT cached: the next launch should retry, since the cause
+        // is a model that may be re-downloaded rather than hardware that will
+        // not change until the driver does.
+        return result;
+    }
+
     const candidates = await orderedAdapterCandidates();
-    const attempts: GpuProbeResult['attempts'] = [];
+    const attempts: GpuProbeResult['attempts'] = [
+        { deviceId: -1, ok: true, ms: control.ms, error: 'cpu control run' },
+    ];
 
     for (const { deviceId, vendor } of candidates) {
         const outcome = await runProbeChild(onnxPath, deviceId);

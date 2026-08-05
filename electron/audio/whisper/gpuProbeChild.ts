@@ -13,14 +13,21 @@
  *
  * Contract:
  *   argv[2] = absolute path to a real .onnx file to open
- *   argv[3] = DirectML adapter index (deviceId)
+ *   argv[3] = DirectML adapter index (deviceId), or 'cpu' for the control run
  *   stdout  = one line of JSON on success: {"ok":true,"ms":1234}
  *   exit 0  = this adapter can create a DirectML session
  *   exit !0 = it cannot (or it took the process down trying)
+ *
+ * The 'cpu' mode is the control. If opening this model dies on the CPU too then
+ * the model is the problem and DirectML is innocent — a distinction worth
+ * having, because "GPU unavailable" and "this checkpoint is broken" produce the
+ * same silent fall back to slow transcription.
  */
 
 const onnxPath = process.argv[2];
-const deviceId = Number.parseInt(process.argv[3] ?? '0', 10);
+const rawDevice = process.argv[3] ?? '0';
+const cpuOnly = rawDevice.toLowerCase() === 'cpu';
+const deviceId = cpuOnly ? -1 : Number.parseInt(rawDevice, 10);
 
 async function main(): Promise<void> {
   if (!onnxPath) {
@@ -37,7 +44,7 @@ async function main(): Promise<void> {
   // must use exactly the options the real session will use, or it proves
   // nothing about the real session.
   const session = await ort.InferenceSession.create(onnxPath, {
-    executionProviders: [{ name: 'dml', deviceId }, 'cpu'],
+    executionProviders: cpuOnly ? ['cpu'] : [{ name: 'dml', deviceId }, 'cpu'],
     executionMode: 'sequential',
     enableMemPattern: false,
     enableCpuMemArena: false,

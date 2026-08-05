@@ -2896,13 +2896,25 @@ export class AppState {
       // system audio). Falls back to globalModel if the per-channel slot is
       // empty or the feature is disabled.
       let modelId = globalModel;
+      let modelSource = 'global setting';
       if (sm.get('localWhisperPerChannelEnabled')) {
         const override = speaker === 'interviewer'
           ? sm.get('localWhisperModelSystem')
           : sm.get('localWhisperModelMic');
-        if (override) modelId = override;
+        if (override) {
+          modelId = override;
+          // Name the source. A per-channel override silently outranks the global
+          // dropdown, so changing the global one and seeing no effect looks like
+          // the setting not saving. From a real session: the user changed both
+          // channels to a multilingual model, and the log still showed
+          // whisper-tiny.en for the mic — the override was what was in force,
+          // and nothing said so.
+          modelSource = override === globalModel
+            ? 'per-channel override'
+            : `per-channel override — the global setting (${globalModel}) is NOT in use for this channel`;
+        }
       }
-      console.log(`[Main] Using LocalWhisperSTT for ${speaker}, model: ${modelId}`);
+      console.log(`[Main] Using LocalWhisperSTT for ${speaker}, model: ${modelId} (${modelSource})`);
       const lws = new LocalWhisperSTT(modelId);
       // Channel label disambiguates the two concurrent instances in latency logs.
       lws.setChannel(speaker === 'interviewer' ? 'system' : 'mic');
@@ -4891,7 +4903,25 @@ export class AppState {
 
   private async _startAudioTestImpl(deviceId?: string): Promise<void> {
     console.log(`[Main] Starting Audio Test on device: ${deviceId || 'default'}`);
-    this.stopAudioTest(); // Stop any existing test (also bumps _audioTestEpoch)
+    // AWAIT the previous teardown before opening the device again.
+    //
+    // MicrophoneCapture.stop() defers the native teardown to a setImmediate and
+    // returns a promise for it — and its own documentation says callers should
+    // await that "before constructing a new native instance / starting again".
+    // This path did not. Scrolling the Settings → Audio tab starts and stops the
+    // test as the meter moves in and out of view, which produced exactly the
+    // forbidden overlap: a second input stream opening on the same endpoint
+    // while the first one's native stop was still queued. From two crash logs,
+    // the last three lines before the process vanished are identical:
+    //
+    //   [Main] Stopping Audio Test
+    //   [MicrophoneCapture] Stopping capture (deferred native teardown)...
+    //   ~1s later: Starting Audio Test → Starting native capture...   <dead>
+    //
+    // No exit code, no JS error — the boot marker records the process
+    // evaluating main.ts and never reaching its exit handler, which is what a
+    // native fault inside the audio backend looks like from JS.
+    await this.stopAudioTestAndAwaitTeardown(); // also bumps _audioTestEpoch
     // UX4 hardening: snapshot epoch BEFORE the system-audio probe's awaited
     // permission probe. If stopAudioTest fires while we're awaiting, the
     // post-await check below catches it and skips system-capture construction.
@@ -5119,6 +5149,29 @@ export class AppState {
         );
       }
     }
+  }
+
+  /**
+   * stopAudioTest(), but resolving only once the NATIVE teardown has actually
+   * finished — not merely once it has been scheduled.
+   *
+   * Both capture wrappers defer their native stop to a setImmediate and return
+   * a promise for it. Fire-and-forget is fine when nothing reopens the device;
+   * it is a use-after-free hazard when something does, which is precisely what
+   * restarting the audio test does. Every caller that will open the device
+   * again must await this instead of stopAudioTest().
+   *
+   * Never rejects: a wrapper that throws on teardown must not prevent the
+   * restart, and the settle is what matters, not the outcome.
+   */
+  public async stopAudioTestAndAwaitTeardown(): Promise<void> {
+    const mic = this.audioTestCapture;
+    const system = this.audioTestSystemCapture;
+    this.stopAudioTest();
+    await Promise.allSettled([
+      mic ? Promise.resolve(mic.stop()) : Promise.resolve(),
+      system ? Promise.resolve(system.stop()) : Promise.resolve(),
+    ]);
   }
 
   public stopAudioTest(): void {

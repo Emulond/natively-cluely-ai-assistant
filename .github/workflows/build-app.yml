@@ -29,11 +29,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Every compile step below is told to use this many jobs. A hosted runner
+      # is 4 vCPU today, but reading it beats hardcoding a number that silently
+      # under-uses a larger runner later.
+      - name: Detect core count
+        id: cores
+        shell: pwsh
+        run: |
+          $n = [Environment]::ProcessorCount
+          Write-Host "Runner has $n logical processors"
+          "count=$n" >> $env:GITHUB_OUTPUT
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
+      # The bundled ONNX models are fetched by postinstall and never change
+      # unless download-models.js does. Re-downloading ~hundreds of MB on every
+      # run is pure wall-clock cost for bytes that are identical each time.
+      - name: Cache bundled ONNX models
+        uses: actions/cache@v4
+        with:
+          path: resources/models
+          key: onnx-models-${{ runner.os }}-${{ hashFiles('scripts/download-models.js') }}
+
+      # Rust artifacts + the cargo registry. The audio module's dependency tree
+      # is the bulk of its ~3 minute build; only native-module/src changes
+      # actually need recompiling.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native-module
+          shared-key: natively-win-x64
 
       # postinstall rebuilds the native node modules against Electron's ABI and
       # downloads the bundled ONNX models, so the packaged app works offline.
@@ -47,7 +76,16 @@ jobs:
         run: npm run build:electron
 
       # Rust audio capture module -> index.win32-x64-msvc.node
+      #
+      # CARGO_BUILD_JOBS matches the runner's core count so codegen fans out
+      # across all of them, and incremental compilation is switched off: it
+      # exists to speed up repeated local edits and only adds bookkeeping to a
+      # cold CI build.
       - name: Build native audio module
+        env:
+          CARGO_BUILD_JOBS: ${{ steps.cores.outputs.count }}
+          CARGO_INCREMENTAL: '0'
+          CARGO_NET_RETRY: '3'
         run: npm run build:native
 
       - name: Verify required local models present
@@ -56,8 +94,22 @@ jobs:
       # Invoke electron-builder directly rather than `npm run dist`: that script
       # re-runs `npm run build`, whose rimraf can race the packager and ENOENT on
       # dist-electron. release-macos.yml documents the same workaround.
+      #
+      # WHERE THE TIME WENT. This step was 11m38s of an 18m30s run — 63% of the
+      # build. Almost all of it is LZMA compressing an app that is mostly
+      # already-compressed ONNX weights and an Electron runtime. `compression=store`
+      # skips that entirely.
+      #
+      # The installer gets bigger; it also gets built several times faster, and
+      # it is downloaded once from a workflow artifact rather than served to
+      # users over a CDN. For this workflow that is the right way round. Drop the
+      # `-c.compression` override if you ever publish these to real users.
       - name: Package Windows installer
-        run: ./node_modules/.bin/electron-builder --win --x64 --publish never
+        env:
+          # electron-builder shells out to 7-Zip and app-builder; both honour
+          # this for their worker pools.
+          UV_THREADPOOL_SIZE: ${{ steps.cores.outputs.count }}
+        run: ./node_modules/.bin/electron-builder --win --x64 --publish never -c.compression=store
 
       # Only the NSIS installer. Globbing release/*.exe also picks up the
       # portable build, and since each carries its own Electron runtime plus the

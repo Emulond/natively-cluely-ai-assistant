@@ -124,6 +124,23 @@ function defaultArenaEnabled(): boolean {
     return process.platform !== 'darwin';
 }
 
+/**
+ * How many Whisper sessions the thread budget has to cover.
+ *
+ * A meeting runs TWO — microphone and system audio — and each was taking
+ * `cores - 2` intra-op threads for itself. On a 6-core/12-thread i5-11260H that
+ * is 10 threads twice over: 20 threads fighting for 12 logical processors, with
+ * the OS scheduler preempting ONNX's own spin-waits. Measured on that machine,
+ * whisper-tiny.en — a 39MB model — took 2.9 seconds to transcribe 1.89 seconds
+ * of speech while large-v3-turbo ran beside it. Tiny should be many times
+ * faster than real time.
+ *
+ * Oversubscription does not make transcription faster; it makes both channels
+ * slower than either would be alone. The budget is therefore machine-wide and
+ * split, not per-session.
+ */
+const CONCURRENT_WHISPER_SESSIONS = 2;
+
 function defaultIntraOpThreads(): number {
     if (process.platform === 'darwin') return 1;
     const cores = os.cpus?.()?.length ?? 1;
@@ -142,7 +159,15 @@ function defaultIntraOpThreads(): number {
     // cores. No upper cap: transcription is the foreground task the user is
     // waiting on, and NATIVELY_ONNX_INTRA_OP_THREADS pins it if a machine
     // prefers otherwise.
-    return Math.max(1, cores - 2);
+    //
+    // The budget is then SPLIT across the concurrent sessions rather than handed
+    // to each in full — see CONCURRENT_WHISPER_SESSIONS. On the i5-11260H that
+    // is 5 threads per channel, 10 in total, instead of 20 threads thrashing 12
+    // logical processors.
+    const budget = Math.max(1, cores - 2);
+    // Never below 2 per session on a multi-core machine: a single-threaded
+    // encoder is the bottleneck this whole function exists to remove.
+    return Math.max(cores > 2 ? 2 : 1, Math.floor(budget / CONCURRENT_WHISPER_SESSIONS));
 }
 
 export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
