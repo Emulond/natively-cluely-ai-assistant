@@ -36,7 +36,15 @@ import { Worker } from 'worker_threads';
 import { resampleToF32 } from './whisper/audioResampler';
 import { VadProcessor } from './whisper/vadProcessor';
 import { filterHallucination } from './whisper/hallucinationFilter';
-import { configureTransformersCache, getModelSizeBytes, getMultilingualModelNames, isMultilingualModel } from './whisper/modelManager';
+import {
+    configureTransformersCache,
+    getCpuRealtimeModelNames,
+    getModelDisplayName,
+    getModelSizeBytes,
+    getMultilingualModelNames,
+    isMultilingualModel,
+    isTooSlowForCpuRealtime,
+} from './whisper/modelManager';
 import { clearLoadSentinel, modelPreloader, writeLoadSentinel } from './whisper/modelPreloader';
 import { buildWorkerInitMessage } from './whisper/inferenceConfig';
 import { resolveWhisperWorkerPath } from './whisper/workerPathResolver';
@@ -326,6 +334,7 @@ export class LocalWhisperSTT extends EventEmitter {
         // Repeat here as well as in setRecognitionLanguage: by now the channel
         // label is set, so the warning says which channel is misconfigured.
         this.warnIfLanguageUnsupportedByModel();
+        this.warnIfModelTooSlowForThisMachine();
         this.vad = new VadProcessor();
         this.spawnWorker().catch((err) => {
             // Gate refusal or worker spawn failure (e.g. insufficient memory for
@@ -817,7 +826,39 @@ export class LocalWhisperSTT extends EventEmitter {
     }
 
     private shortModelName(): string {
-        return this.modelId.split('/').pop() ?? this.modelId;
+        return getModelDisplayName(this.modelId);
+    }
+
+    /**
+     * Say — before the meeting, not 25 seconds into it — when this model cannot
+     * keep up on this machine.
+     *
+     * Whisper Large v3 Turbo with no GPU is the case that motivated this. On a
+     * 6-core i5-11260H it did not return a transcript for a 1.9s phrase within
+     * 25 seconds and pushed the process to 6.8GB resident, which then starved
+     * the other channel's 39MB Tiny model into the same timeout. Everything
+     * about that failure is predictable at start(): the model's speed tier and
+     * whether a GPU was found are both already known.
+     */
+    private warnIfModelTooSlowForThisMachine(): void {
+        if (!isTooSlowForCpuRealtime(this.modelId)) return;
+        let onGpu = false;
+        try {
+            const { getResolvedGpuDevice } = require('./whisper/gpuProbe');
+            onGpu = getResolvedGpuDevice()?.deviceId !== null && getResolvedGpuDevice() !== null;
+        } catch { /* no probe ⇒ CPU */ }
+        if (onGpu) return;
+        const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+        const alternatives = getCpuRealtimeModelNames(this.language !== 'auto' && !this.language.startsWith('english'));
+        console.warn(
+            `[LocalWhisperSTT${tag}] ${this.shortModelName()} is a large model and no GPU was ` +
+            `available, so it will run on the CPU. Expect it to fall behind live speech and skip ` +
+            `phrases. Faster choices for this machine: ${alternatives.join(', ')}.`,
+        );
+        this.reportDegraded(
+            `${this.shortModelName()} is too large to keep up on this computer's CPU. ` +
+            `Switch to ${alternatives[0] ?? 'a smaller model'} in Settings → Audio.`,
+        );
     }
 
     /**

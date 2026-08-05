@@ -83,6 +83,37 @@ export function getMultilingualModelNames(): string[] {
   return MODEL_CATALOG.filter(m => m.multilingual).map(m => m.name);
 }
 
+/** Display name from the catalog, so logs use the words the settings page uses. */
+export function getModelDisplayName(modelId: string): string {
+  return MODEL_CATALOG.find(m => m.id === modelId)?.name ?? modelId;
+}
+
+/**
+ * Models that cannot keep up with live speech on a CPU.
+ *
+ * Whisper Large v3 Turbo is the clearest case. On a 6-core i5-11260H with no
+ * GPU it did not return a transcript for a 1.9-second phrase within 25 seconds,
+ * and it drove the process to 6.8GB resident — which then dragged the OTHER
+ * channel's 39MB Tiny model down to the same 25-second timeout through sheer
+ * memory pressure. One oversized choice takes the whole meeting with it.
+ *
+ * The catalog's own speed tier is the source of truth, so a model added later
+ * is classified without touching this function.
+ */
+export function isTooSlowForCpuRealtime(modelId: string): boolean {
+  const entry = MODEL_CATALOG.find(m => m.id === modelId);
+  if (!entry) return false;
+  return entry.speed === 'medium' || entry.speed === 'slow';
+}
+
+/** Catalogued models that DO keep up on a CPU — what to suggest instead. */
+export function getCpuRealtimeModelNames(multilingualOnly: boolean): string[] {
+  return MODEL_CATALOG
+    .filter(m => !isTooSlowForCpuRealtime(m.id))
+    .filter(m => (multilingualOnly ? m.multilingual : true))
+    .map(m => m.name);
+}
+
 /**
  * Returns the directory where Whisper models are stored.
  * Uses electron app.getPath('userData') so models persist across updates.

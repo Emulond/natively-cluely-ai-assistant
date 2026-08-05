@@ -7230,6 +7230,17 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (typeof cfg?.micModelId === 'string') sm.set('localWhisperModelMic', cfg.micModelId);
         if (typeof cfg?.systemModelId === 'string')
           sm.set('localWhisperModelSystem', cfg.systemModelId);
+        // Read the values BACK and log them. Nothing recorded a model change, so
+        // when a session later ran a model the user thought they had replaced,
+        // the log could not answer the first question worth asking: did the
+        // change save at all? Now it can.
+        console.log(
+          '[Settings] local Whisper channel models now: ' +
+          `splitChannels=${!!sm.get('localWhisperPerChannelEnabled')} ` +
+          `mic=${sm.get('localWhisperModelMic') || '(unset → global)'} ` +
+          `system=${sm.get('localWhisperModelSystem') || '(unset → global)'} ` +
+          `global=${sm.get('localWhisperModel') || '(unset)'}`,
+        );
         return { success: true };
       } catch (e: any) {
         return { success: false, error: e.message };
