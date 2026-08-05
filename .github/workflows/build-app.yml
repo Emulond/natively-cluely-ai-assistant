@@ -97,19 +97,21 @@ jobs:
       #
       # WHERE THE TIME WENT. This step was 11m38s of an 18m30s run — 63% of the
       # build. Almost all of it is LZMA compressing an app that is mostly
-      # already-compressed ONNX weights and an Electron runtime. `compression=store`
-      # skips that entirely.
+      # already-compressed ONNX weights and an Electron runtime.
+      # electron-builder.fast.cjs sets compression: 'store' and inherits
+      # everything else from package.json `build`.
       #
-      # The installer gets bigger; it also gets built several times faster, and
-      # it is downloaded once from a workflow artifact rather than served to
-      # users over a CDN. For this workflow that is the right way round. Drop the
-      # `-c.compression` override if you ever publish these to real users.
+      # The config lives in a FILE rather than a `-c.compression=store` flag
+      # because PowerShell — the shell for `run:` steps on windows-latest — does
+      # not pass that dot-notation through intact. electron-builder read `-c` as
+      # --config and `.compression=store` as the filename:
+      #   ⨯ ENOENT: no such file or directory, open '...\.compression=store'
       - name: Package Windows installer
         env:
           # electron-builder shells out to 7-Zip and app-builder; both honour
           # this for their worker pools.
           UV_THREADPOOL_SIZE: ${{ steps.cores.outputs.count }}
-        run: ./node_modules/.bin/electron-builder --win --x64 --publish never -c.compression=store
+        run: ./node_modules/.bin/electron-builder --win --x64 --publish never --config electron-builder.fast.cjs
 
       # Only the NSIS installer. Globbing release/*.exe also picks up the
       # portable build, and since each carries its own Electron runtime plus the
