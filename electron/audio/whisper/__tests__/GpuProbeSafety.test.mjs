@@ -216,27 +216,73 @@ describe('int8 is proven separately from float', () => {
   test('a refusal downgrades the dtype, it does not abandon the GPU', () => {
     // fp32 on a Turing card still beats the CPU comfortably.
     assert.match(workerSrc, /const gpuRejectsInt8 = useGpu && msg\.gpuQuantizedOk !== true/);
-    assert.match(workerSrc, /effectiveDtype = 'fp32'/);
+    assert.match(workerSrc, /effectiveDtype = usable/, 'fp16 or fp32, whichever is cached');
     assert.match(workerSrc, /dtype: device \? effectiveDtype : dtype/);
   });
 
-  test('fp32 is only chosen when those weights are already on disk', () => {
+  test('the replacement precision is only chosen when it is already on disk', () => {
     // Models download at the mixed default — fp32 encoder, QUANTISED decoders.
-    // Asking for uniform fp32 asks for a decoder that was never fetched, and
-    // transformers.js answers by downloading several hundred MB, silently, at
+    // Asking for any other uniform precision asks for files that were never
+    // fetched, and transformers.js answers by downloading them, silently, at
     // meeting start. The worker never reaches "model READY" and the channel
     // shows "STT reconnecting" forever. The diagnostics said so all along:
     //   decoderFile: decoder_model_merged.onnx  decoderBytes: -1
-    assert.match(workerSrc, /const fp32DecoderPresent = \(\): boolean =>/);
+    assert.match(workerSrc, /const dtypeFilesPresent = \(dt: 'fp16' \| 'fp32'\): boolean =>/);
     assert.match(
       workerSrc,
-      /if \(fp32DecoderPresent\(\)\) \{[\s\S]{0,400}?effectiveDtype = 'fp32'/,
-      'the fp32 switch must be gated on the files existing',
+      /const usable = \(\['fp16', 'fp32'\] as const\)\.find\(dtypeFilesPresent\)/,
+      'fp16 must be preferred: half the download, half the VRAM, native to DirectML',
     );
     assert.match(
       workerSrc,
-      /\} else \{[\s\S]{0,600}?preferredDevice = undefined;/,
-      'with no cached fp32 decoder the GPU must be dropped, not the download started',
+      /\} else \{[\s\S]{0,700}?preferredDevice = undefined;/,
+      'with neither precision cached the GPU must be dropped, not a download started',
+    );
+  });
+
+  test('the presence check accepts either decoder layout', () => {
+    // A model ships EITHER a merged decoder OR the split decoder + with_past
+    // pair; demanding both would reject every model.
+    assert.match(
+      workerSrc,
+      /return has\(`decoder_model_merged\$\{suffix\}\.onnx`\)\s*\n\s*\|\| \(has\(`decoder_model\$\{suffix\}\.onnx`\) && has\(`decoder_with_past_model\$\{suffix\}\.onnx`\)\)/,
+    );
+  });
+
+  test('downloads fetch the GPU precision up front, meetings never do', () => {
+    // The one moment the user has deliberately asked to wait for bytes.
+    const cfg = read('electron/audio/whisper/inferenceConfig.ts');
+    assert.match(cfg, /export function resolveExtraDownloadDtypes/);
+    assert.match(cfg, /return \['fp16'\]/);
+    assert.match(
+      cfg,
+      /extraDtypes: opts\?\.forDownload \? resolveExtraDownloadDtypes\(gpuDeviceId\) : undefined/,
+      'extraDtypes must be opt-in per call, never set on the meeting path',
+    );
+    assert.match(
+      cfg,
+      /if \(gpuDeviceId === null \|\| gpuDeviceId === undefined\) return undefined/,
+      'a machine with no usable GPU must not download bytes it can never read',
+    );
+    assert.match(
+      read('electron/services/LocalModelDownloadService.ts'),
+      /buildWorkerInitMessage\(modelId, \{ forDownload: true \}\)/,
+    );
+  });
+
+  test('the extra fetch completes before the download reports ready', () => {
+    // The service treats 'ready' as completion; posting it first would report a
+    // finished download with files still arriving.
+    const loopIdx = workerSrc.indexOf('for (const extra of msg.extraDtypes');
+    const readyIdx = workerSrc.indexOf("postMessage({ type: 'ready' })", loopIdx);
+    assert.ok(loopIdx > 0, 'the extra-precision loop must exist');
+    assert.ok(readyIdx > loopIdx, "'ready' must be posted after the extra passes");
+  });
+
+  test('an unpublished precision does not fail an otherwise good download', () => {
+    assert.match(
+      workerSrc,
+      /catch \(extraErr: any\) \{[\s\S]{0,500}?the model itself downloaded fine/,
     );
   });
 

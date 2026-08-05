@@ -82,6 +82,16 @@ export interface WorkerInitMessage {
   // Human-readable explanation of that choice, logged verbatim by the worker so
   // "why is it on the CPU / the wrong GPU" is answerable from a log alone.
   gpuReason?: string;
+  // Additional precisions to fetch into the cache after the model itself
+  // loads. Set ONLY on the download path (Settings → Audio), never when
+  // starting a meeting: each entry costs another full download.
+  //
+  // A model's normal download brings an fp32 encoder and QUANTISED decoders.
+  // A GPU that refuses int8 needs the fp32 decoders as well, and discovering
+  // that mid-meeting means either a silent multi-hundred-MB download or a
+  // fallback to the CPU. Fetching them at download time is the moment the user
+  // has actually asked to wait for bytes.
+  extraDtypes?: Array<string | Record<string, string>>;
 }
 export interface WorkerTranscribeMessage {
   type: 'transcribe';

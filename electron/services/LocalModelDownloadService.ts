@@ -660,7 +660,10 @@ export function createWhisperDownloadProvider(): LocalModelDownloadProvider {
     },
     buildInitMessage(modelId: string): unknown {
       const { buildWorkerInitMessage } = require('../audio/whisper/inferenceConfig') as typeof import('../audio/whisper/inferenceConfig');
-      return buildWorkerInitMessage(modelId);
+      // forDownload: also fetch the precision a GPU would need, at the one
+      // moment the user has deliberately asked to wait for bytes — rather than
+      // discovering the gap when they press Start Live Meeting.
+      return buildWorkerInitMessage(modelId, { forDownload: true });
     },
   };
 }

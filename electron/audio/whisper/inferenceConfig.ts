@@ -86,7 +86,10 @@ function dtypeSizeFactor(dtype: string | Record<string, string>): number {
  * consistent. The cacheDir lookup is lazy (avoids importing electron from
  * this leaf module).
  */
-export function buildWorkerInitMessage(modelId: string): WorkerInitMessage {
+export function buildWorkerInitMessage(
+    modelId: string,
+    opts?: { forDownload?: boolean },
+): WorkerInitMessage {
     // Late require — modelManager imports electron, which isn't available
     // when this module is first loaded in some contexts (test harnesses).
     const { getModelsDir, getModelSizeBytes, getModelExternalDataFormat } = require('./modelManager');
@@ -144,7 +147,42 @@ export function buildWorkerInitMessage(modelId: string): WorkerInitMessage {
         gpuDeviceId,
         gpuQuantizedOk,
         gpuReason,
+        extraDtypes: opts?.forDownload ? resolveExtraDownloadDtypes(gpuDeviceId) : undefined,
     };
+}
+
+/**
+ * Extra precisions worth fetching while the user is already waiting on a
+ * download.
+ *
+ * A model's normal download is an fp32 encoder plus QUANTISED decoders. That is
+ * the right set for CPU inference and the wrong set for a GPU that refuses
+ * int8 — and DirectML's int8 operator coverage is narrow enough that refusing
+ * is common. Discovering the gap at meeting time leaves two bad options: start
+ * a several-hundred-MB download under someone who just pressed Start Live
+ * Meeting, or fall back to the CPU and be slow.
+ *
+ * WHY fp16 AND NOT fp32. Both are published; the file listing for
+ * Xenova/whisper-small settles it:
+ *
+ *   decoder_model_merged.onnx        615,405,212 B   (fp32)
+ *   decoder_model_merged_fp16.onnx   308,615,077 B   (fp16)
+ *   encoder_model.onnx               352,839,389 B   (fp32)
+ *   encoder_model_fp16.onnx          176,608,338 B   (fp16)
+ *
+ * fp16 is half the download, half the VRAM — 484MB against 968MB, the
+ * difference between comfortable and tight on a 4GB laptop card — and it is
+ * DirectML's native precision rather than a tolerated one. Turing and later run
+ * fp16 at twice the fp32 rate. There is no axis on which fp32 wins here.
+ *
+ * Machines with no usable GPU fetch nothing extra: there is no path on which it
+ * would ever be read.
+ */
+export function resolveExtraDownloadDtypes(
+    gpuDeviceId: number | null,
+): Array<string | Record<string, string>> | undefined {
+    if (gpuDeviceId === null || gpuDeviceId === undefined) return undefined;
+    return ['fp16'];
 }
 
 /**

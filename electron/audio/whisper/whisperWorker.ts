@@ -395,51 +395,64 @@ parentPort.on('message', async (msg: any) => {
       // which is also where a Turing card is fastest anyway.
       const gpuRejectsInt8 = useGpu && msg.gpuQuantizedOk !== true;
 
-      // ...BUT ONLY IF THE fp32 WEIGHTS ARE ALREADY ON DISK.
+      // ...AND THE REPLACEMENT PRECISION MUST ALREADY BE ON DISK.
       //
       // Models download at the mixed default: an fp32 encoder and QUANTISED
-      // decoders. Asking for uniform fp32 asks for a decoder file that was
-      // never fetched, and transformers.js responds by downloading it — several
-      // hundred megabytes, silently, at meeting start. The worker never reaches
-      // "model READY", the channel shows "STT reconnecting" forever, and
-      // nothing in the log says a download is underway. That is what happened
-      // with whisper-small: the diagnostics recorded it plainly and I did not
-      // read them —
+      // decoders. Asking for any other uniform precision asks for files that
+      // were never fetched, and transformers.js answers by downloading them —
+      // hundreds of megabytes, silently, at meeting start. The worker never
+      // reaches "model READY", the channel shows "STT reconnecting" forever,
+      // and nothing in the log says a download is underway. The diagnostics
+      // recorded it plainly and it was missed:
       //
-      //   encoderFile: encoder_model.onnx        encoderBytes: 352839389
-      //   decoderFile: decoder_model_merged.onnx decoderBytes: -1
+      //   encoderFile: encoder_model.onnx         encoderBytes: 352839389
+      //   decoderFile: decoder_model_merged.onnx  decoderBytes: -1
       //
-      // -1 is "not present". So check before switching, and stay on the CPU
-      // when the files are missing: slow transcription beats none.
-      const fp32DecoderPresent = (): boolean => {
+      // fp16 FIRST. Both alternatives are published — for Xenova/whisper-small,
+      // the fp32 decoder is 615MB against 308MB for fp16, and the fp32 encoder
+      // 353MB against 177MB. fp16 is half the disk, half the VRAM (484MB vs
+      // 968MB, the difference between comfortable and tight on a 4GB laptop
+      // card), DirectML's native precision rather than a tolerated one, and
+      // twice the arithmetic rate on Turing and later. fp32 is the fallback for
+      // a machine that happens to have those files already.
+      const dtypeFilesPresent = (dt: 'fp16' | 'fp32'): boolean => {
         try {
           const _fs = require('fs');
           const _path = require('path');
           const parts = String(msg.modelId).split('/');
           const dir = _path.join(String(msg.cacheDir), parts[0] ?? '', parts[1] ?? '', 'onnx');
-          return ['decoder_model_merged.onnx', 'decoder_model.onnx'].some((f) => {
-            try { return _fs.statSync(_path.join(dir, f)).size > 0; } catch { return false; }
-          });
+          const suffix = dt === 'fp32' ? '' : '_fp16';
+          const has = (name: string) => {
+            try { return _fs.statSync(_path.join(dir, name)).size > 0; } catch { return false; }
+          };
+          if (!has(`encoder_model${suffix}.onnx`)) return false;
+          // A model ships EITHER a merged decoder OR the split pair.
+          return has(`decoder_model_merged${suffix}.onnx`)
+            || (has(`decoder_model${suffix}.onnx`) && has(`decoder_with_past_model${suffix}.onnx`));
         } catch { return false; }
       };
 
       let effectiveDtype: string | Record<string, string> = dtype;
       if (gpuRejectsInt8) {
-        if (fp32DecoderPresent()) {
-          effectiveDtype = 'fp32';
+        const usable = (['fp16', 'fp32'] as const).find(dtypeFilesPresent);
+        if (usable) {
+          effectiveDtype = usable;
           console.log(
-            '[WhisperWorker] DirectML did not accept an int8 graph on this adapter — ' +
-            'loading the fp32 weights already on disk instead of the mixed q8 default',
+            `[WhisperWorker] DirectML did not accept an int8 graph on this adapter — ` +
+            `loading the ${usable} weights already on disk instead of the mixed q8 default`,
           );
         } else {
           console.warn(
-            `[WhisperWorker] DirectML refuses int8 on this adapter and ${msg.modelId} has no ` +
-            'fp32 decoder cached — using the CPU rather than triggering a multi-hundred-MB ' +
-            'download in the middle of a meeting.',
+            `[WhisperWorker] DirectML refuses int8 on this adapter and ${msg.modelId} has ` +
+            'neither fp16 nor fp32 weights cached — using the CPU rather than triggering a ' +
+            'multi-hundred-MB download in the middle of a meeting. Re-download this model in ' +
+            'Settings → Audio to fetch the GPU precision alongside it.',
           );
           preferredDevice = undefined;
         }
       }
+
+      // Our own EP list wins over transformers.js's, per the ??= above.
       const gpuExecutionProviders = useGpu
         ? [{ name: 'dml', deviceId: probedDeviceId }, 'cpu']
         : undefined;
@@ -571,6 +584,42 @@ parentPort.on('message', async (msg: any) => {
       // New model = stale prompt cache (different tokenizer vocab)
       cachedPromptText = '';
       cachedPromptIds = null;
+
+      // EXTRA PRECISIONS — download path only (see WorkerInitMessage.extraDtypes).
+      //
+      // Deliberately BEFORE 'ready': the download service treats ready as
+      // completion, so posting first would report a finished download with
+      // files still arriving. Each pass is best-effort — a precision a
+      // repository does not publish must not fail a download that otherwise
+      // succeeded, so the failure is logged and the loop moves on.
+      for (const extra of msg.extraDtypes ?? []) {
+        const label = typeof extra === 'string' ? extra : JSON.stringify(extra);
+        try {
+          console.log(`[WhisperWorker] fetching extra precision ${label} for ${msg.modelId}...`);
+          const t0 = Date.now();
+          await pipeline('automatic-speech-recognition', msg.modelId, {
+            dtype: extra,
+            session_options: sessionOptions,
+            ...(useExternalDataFormat !== undefined
+              ? { use_external_data_format: useExternalDataFormat }
+              : {}),
+            progress_callback: (data: any) => {
+              const { pct } = aggregator.update(data);
+              if (pct === null) return;
+              parentPort!.postMessage({ type: 'progress', modelId: msg.modelId, progress: pct });
+            },
+          });
+          console.log(
+            `[WhisperWorker] extra precision ${label} cached for ${msg.modelId} in ${Date.now() - t0}ms`,
+          );
+        } catch (extraErr: any) {
+          console.warn(
+            `[WhisperWorker] extra precision ${label} unavailable for ${msg.modelId} ` +
+            `(${extraErr?.message ?? extraErr}) — the model itself downloaded fine; ` +
+            'GPU inference will use whichever precision is present.',
+          );
+        }
+      }
 
       parentPort!.postMessage({ type: 'ready' });
     } catch (e: any) {
