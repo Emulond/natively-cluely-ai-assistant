@@ -330,6 +330,18 @@ export function LocalWhisperModelPanel() {
     }
 
     const availableModels = models.filter(m => m.status === 'available');
+    // Per-channel selectors get an explicit "Off". Whisper runs one session per
+    // channel, and the second is not a small extra cost — it is another full
+    // copy of the model resident and another thread pool contending for the
+    // same cores. Someone who only needs meeting audio (or only their own
+    // voice) was paying for a channel they never read, with no way to say so.
+    //
+    // Off is per-channel only: turning BOTH off would mean local transcription
+    // with nothing to transcribe, which is what switching provider is for.
+    const channelOptions = [
+        { id: 'off', name: t('Off — do not transcribe this channel') },
+        ...availableModels,
+    ];
     
     return (
         <div className="space-y-4">
@@ -412,14 +424,14 @@ export function LocalWhisperModelPanel() {
                                     label={t("Mic Audio Model")}
                                     value={config.micModelId}
                                     onChange={setMicModel}
-                                    options={availableModels}
+                                    options={channelOptions}
                                     placeholder={t("Select mic model")}
                                 />
                                 <PremiumSelect
                                     label={t("System Audio Model")}
                                     value={config.systemModelId}
                                     onChange={setSystemModel}
-                                    options={availableModels}
+                                    options={channelOptions}
                                     placeholder={t("Select system model")}
                                 />
                             </motion.div>

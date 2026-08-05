@@ -210,7 +210,7 @@ parentPort.on('message', async (msg: any) => {
       const dtypeDesc = typeof dtype === 'string'
         ? dtype
         : 'mixed:' + Object.entries(dtype).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join(',');
-      const sessionOptions = getBoundedOnnxSessionOptions();
+      const sessionOptions = getBoundedOnnxSessionOptions(msg.concurrentSessions);
 
       console.log(`[WhisperWorker] Loading ${msg.modelId} | providers=${providers.join(',')} | dtype=${dtypeDesc}`);
 
@@ -376,7 +376,7 @@ parentPort.on('message', async (msg: any) => {
 
       // DirectML's own mandatory session options — NOT the CPU ones. Passing
       // the CPU set here is precisely the bug that crashed the app twice.
-      const gpuSessionOptions = useGpu ? getDirectMLSessionOptions() : null;
+      const gpuSessionOptions = useGpu ? getDirectMLSessionOptions(msg.concurrentSessions) : null;
       let preferredDevice: string | undefined = useGpu ? 'dml' : undefined;
 
       // INT8 IS NOT A GIVEN ON DIRECTML.

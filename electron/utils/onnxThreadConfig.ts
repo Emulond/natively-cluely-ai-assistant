@@ -141,7 +141,7 @@ function defaultArenaEnabled(): boolean {
  */
 const CONCURRENT_WHISPER_SESSIONS = 2;
 
-function defaultIntraOpThreads(): number {
+function defaultIntraOpThreads(concurrentSessions = CONCURRENT_WHISPER_SESSIONS): number {
     if (process.platform === 'darwin') return 1;
     const cores = os.cpus?.()?.length ?? 1;
     // Speech transcription is the latency-critical foreground task on this
@@ -165,14 +165,18 @@ function defaultIntraOpThreads(): number {
     // is 5 threads per channel, 10 in total, instead of 20 threads thrashing 12
     // logical processors.
     const budget = Math.max(1, cores - 2);
+    // Divided by however many sessions will REALLY be live. Hardcoding 2 meant a
+    // user who turned one channel off still ran the survivor on half the cores,
+    // paying for a session that no longer exists.
+    const sessions = Math.max(1, Math.floor(concurrentSessions) || 1);
     // Never below 2 per session on a multi-core machine: a single-threaded
     // encoder is the bottleneck this whole function exists to remove.
-    return Math.max(cores > 2 ? 2 : 1, Math.floor(budget / CONCURRENT_WHISPER_SESSIONS));
+    return Math.max(cores > 2 ? 2 : 1, Math.floor(budget / sessions));
 }
 
-export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
+export function getBoundedOnnxSessionOptions(concurrentSessions?: number): OnnxThreadBounds {
     return {
-        intraOpNumThreads: readIntEnv('NATIVELY_ONNX_INTRA_OP_THREADS', defaultIntraOpThreads()),
+        intraOpNumThreads: readIntEnv('NATIVELY_ONNX_INTRA_OP_THREADS', defaultIntraOpThreads(concurrentSessions)),
         interOpNumThreads: readIntEnv('NATIVELY_ONNX_INTER_OP_THREADS', 1),
         executionMode: 'sequential',
         // Disable ORT's persistent BFCArena/memory-pattern reuse by default.
@@ -210,9 +214,9 @@ export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
  * The thread counts are left alone. They are ignored for GPU-assigned nodes and
  * still apply to whatever falls back to the CPU provider.
  */
-export function getDirectMLSessionOptions(): OnnxThreadBounds {
+export function getDirectMLSessionOptions(concurrentSessions?: number): OnnxThreadBounds {
     return {
-        ...getBoundedOnnxSessionOptions(),
+        ...getBoundedOnnxSessionOptions(concurrentSessions),
         executionMode: 'sequential',
         enableMemPattern: false,
         enableCpuMemArena: false,

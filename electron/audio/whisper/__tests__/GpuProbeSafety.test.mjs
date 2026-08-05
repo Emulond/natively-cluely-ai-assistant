@@ -64,7 +64,7 @@ describe('DirectML session options', () => {
     const src = read('electron/audio/whisper/whisperWorker.ts');
     assert.match(
       src,
-      /const gpuSessionOptions = useGpu \? getDirectMLSessionOptions\(\) : null/,
+      /const gpuSessionOptions = useGpu \? getDirectMLSessionOptions\(msg\.concurrentSessions\) : null/,
       'the GPU path must derive its own session options',
     );
     assert.match(

@@ -1434,9 +1434,13 @@ export class AppState {
             settingsManager.set('localWhisperModel', modelId);
           }
           if (settingsManager.get('localWhisperPerChannelEnabled')) {
+            const { isChannelDisabled: chanOff } = require('./audio/whisper/modelManager');
             for (const key of ['localWhisperModelMic', 'localWhisperModelSystem'] as const) {
               const raw = settingsManager.get(key);
-              if (raw && !MODEL_CATALOG_IDS.has(raw)) {
+              // 'off' is a deliberate choice, not a corrupt id. Repairing it
+              // back to a real model would silently re-enable a channel the
+              // user turned off and hand back the CPU cost they opted out of.
+              if (raw && !chanOff(raw) && !MODEL_CATALOG_IDS.has(raw)) {
                 console.warn(`[AppState] Persisted ${key} "${raw}" not in catalog — resetting to ${FALLBACK}`);
                 settingsManager.set(key, FALLBACK);
               }
@@ -2897,6 +2901,25 @@ export class AppState {
       // empty or the feature is disabled.
       let modelId = globalModel;
       let modelSource = 'global setting';
+      // A channel set to 'off' spawns NO worker. Whisper runs one session per
+      // channel, and the second is not a small extra cost — it is another full
+      // copy of the model resident and another thread pool contending for the
+      // same cores. Returning null here is already the established "no provider"
+      // signal: every capture write site is `?.write`, so the audio is simply
+      // never handed anywhere.
+      if (sm.get('localWhisperPerChannelEnabled')) {
+        const channelModel = speaker === 'interviewer'
+          ? sm.get('localWhisperModelSystem')
+          : sm.get('localWhisperModelMic');
+        const { isChannelDisabled } = require('./audio/whisper/modelManager');
+        if (isChannelDisabled(channelModel)) {
+          console.log(
+            `[Main] Local Whisper is OFF for ${speaker} — no model will be loaded and this ` +
+            'channel will not be transcribed. The other channel gets the full CPU budget.',
+          );
+          return null;
+        }
+      }
       if (sm.get('localWhisperPerChannelEnabled')) {
         const override = speaker === 'interviewer'
           ? sm.get('localWhisperModelSystem')

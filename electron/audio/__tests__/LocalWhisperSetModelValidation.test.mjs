@@ -128,22 +128,33 @@ test("local-whisper-set-model validates the id against MODEL_CATALOG_IDS", () =>
 test('local-whisper-set-channel-config validates non-empty mic/system ids', () => {
   const src = readSrc('electron/ipcHandlers.ts');
   const body = stripCommentsAndStrings(findSafeHandleBody(src, 'local-whisper-set-channel-config'));
+  // The catalog check now lives in a helper, because 'off' is a legal value
+  // meaning "do not transcribe this channel" — an unknown-model rejection would
+  // make it impossible to select. What must remain true is that BOTH ids are
+  // validated, and that an empty string still clears the override.
   assert.ok(
-    body.includes('MODEL_CATALOG_IDS.has(cfg.micModelId)'),
-    "channel-config handler must validate the mic id",
+    body.includes('isChannelDisabled(id)||MODEL_CATALOG_IDS.has(id)')
+      || body.includes('isChannelDisabled(id) || MODEL_CATALOG_IDS.has(id)'),
+    'the channel validator must accept the off sentinel or a catalogued model',
   );
   assert.ok(
-    body.includes('MODEL_CATALOG_IDS.has(cfg.systemModelId)'),
-    "channel-config handler must validate the system id",
+    body.includes('validChannelModel(cfg.micModelId)'),
+    'channel-config handler must validate the mic id',
+  );
+  assert.ok(
+    body.includes('validChannelModel(cfg.systemModelId)'),
+    'channel-config handler must validate the system id',
   );
   // Empty strings must still be accepted (= clear override).
   assert.ok(
-    body.includes('cfg.micModelId&&!MODEL_CATALOG_IDS.has(cfg.micModelId)') || body.includes('cfg.micModelId&& !MODEL_CATALOG_IDS') || body.includes('cfg.micModelId && !MODEL_CATALOG_IDS'),
-    "channel-config handler must allow empty-string mic ids (clear override)",
+    body.includes('cfg.micModelId&&!validChannelModel(cfg.micModelId)')
+      || body.includes('cfg.micModelId && !validChannelModel(cfg.micModelId)'),
+    'channel-config handler must allow empty-string mic ids (clear override)',
   );
   assert.ok(
-    body.includes('cfg.systemModelId&&!MODEL_CATALOG_IDS.has(cfg.systemModelId)') || body.includes('cfg.systemModelId&& !MODEL_CATALOG_IDS') || body.includes('cfg.systemModelId && !MODEL_CATALOG_IDS'),
-    "channel-config handler must allow empty-string system ids (clear override)",
+    body.includes('cfg.systemModelId&&!validChannelModel(cfg.systemModelId)')
+      || body.includes('cfg.systemModelId && !validChannelModel(cfg.systemModelId)'),
+    'channel-config handler must allow empty-string system ids (clear override)',
   );
 });
 

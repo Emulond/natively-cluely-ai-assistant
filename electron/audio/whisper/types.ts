@@ -92,6 +92,11 @@ export interface WorkerInitMessage {
   // fallback to the CPU. Fetching them at download time is the moment the user
   // has actually asked to wait for bytes.
   extraDtypes?: Array<string | Record<string, string>>;
+  // How many Whisper sessions will be live at once (1 when the user has turned
+  // a channel off, otherwise 2). The intra-op thread budget is divided by this,
+  // so a user who disabled a channel gets the whole machine for the survivor
+  // instead of half of it.
+  concurrentSessions?: number;
 }
 export interface WorkerTranscribeMessage {
   type: 'transcribe';

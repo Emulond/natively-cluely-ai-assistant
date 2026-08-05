@@ -148,7 +148,36 @@ export function buildWorkerInitMessage(
         gpuQuantizedOk,
         gpuReason,
         extraDtypes: opts?.forDownload ? resolveExtraDownloadDtypes(gpuDeviceId) : undefined,
+        concurrentSessions: resolveActiveWhisperChannelCount(),
     };
+}
+
+/**
+ * How many Whisper sessions will actually be live at once.
+ *
+ * The intra-op thread budget is split across concurrent sessions so two
+ * channels cannot oversubscribe the machine. Hardcoding that divisor at 2
+ * meant a user who turned one channel OFF still had the survivor running on
+ * half the cores — paying the cost of a session that no longer exists.
+ *
+ * Counts what is configured, not what happens to be running: the count is read
+ * when a worker is created, and both channels start within the same moment of
+ * meeting setup.
+ */
+export function resolveActiveWhisperChannelCount(): number {
+    try {
+        const { SettingsManager } = require('../../services/SettingsManager');
+        const { isChannelDisabled } = require('./modelManager');
+        const sm = SettingsManager.getInstance();
+        if (!sm.get('localWhisperPerChannelEnabled')) return 2;
+        const off = [sm.get('localWhisperModelMic'), sm.get('localWhisperModelSystem')]
+            .filter((id: string | undefined) => isChannelDisabled(id)).length;
+        return Math.max(1, 2 - off);
+    } catch {
+        // Settings unreachable (test contexts) — assume both, which is the
+        // conservative direction: fewer threads each, never oversubscribed.
+        return 2;
+    }
 }
 
 /**

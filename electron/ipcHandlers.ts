@@ -7219,11 +7219,14 @@ export function initializeIpcHandlers(appState: AppState): void {
     async (_, cfg: { enabled?: boolean; micModelId?: string; systemModelId?: string }) => {
       try {
         const sm = SettingsManager.getInstance();
-        const { MODEL_CATALOG_IDS } = require('./audio/whisper/modelManager');
-        if (typeof cfg?.micModelId === 'string' && cfg.micModelId && !MODEL_CATALOG_IDS.has(cfg.micModelId)) {
+        const { MODEL_CATALOG_IDS, isChannelDisabled } = require('./audio/whisper/modelManager');
+        // 'off' is a legal selection, not an unknown model: it means this
+        // channel transcribes nothing and spawns no worker.
+        const validChannelModel = (id: string) => isChannelDisabled(id) || MODEL_CATALOG_IDS.has(id);
+        if (typeof cfg?.micModelId === 'string' && cfg.micModelId && !validChannelModel(cfg.micModelId)) {
           return { success: false, error: `Unknown local Whisper mic model: ${cfg.micModelId}` };
         }
-        if (typeof cfg?.systemModelId === 'string' && cfg.systemModelId && !MODEL_CATALOG_IDS.has(cfg.systemModelId)) {
+        if (typeof cfg?.systemModelId === 'string' && cfg.systemModelId && !validChannelModel(cfg.systemModelId)) {
           return { success: false, error: `Unknown local Whisper system model: ${cfg.systemModelId}` };
         }
         if (typeof cfg?.enabled === 'boolean') sm.set('localWhisperPerChannelEnabled', cfg.enabled);

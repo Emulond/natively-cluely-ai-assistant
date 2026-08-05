@@ -60,6 +60,27 @@ const MODEL_CATALOG: WhisperModelInfo[] = [
 export const MODEL_CATALOG_IDS: Set<string> = new Set(MODEL_CATALOG.map(m => m.id));
 
 /**
+ * Per-channel model value meaning "transcribe nothing on this channel".
+ *
+ * Whisper runs one session PER CHANNEL — microphone and system audio — and on a
+ * CPU that cannot keep up, the second session is not a small extra cost. It is a
+ * second full copy of the model resident in memory and a second thread pool
+ * competing with the first for the same cores. Measured on a 6-core i5-11260H
+ * with Whisper Small on both channels: a median of 12x slower than real time,
+ * and 41% of speech discarded by backpressure before it ever reached the model.
+ *
+ * Plenty of people only need one side — meeting audio without their own voice,
+ * or the reverse. Making them pay for a channel they never read was the app's
+ * choice, not a technical necessity.
+ */
+export const CHANNEL_MODEL_OFF = 'off';
+
+/** True when a per-channel selection means "don't transcribe this channel". */
+export function isChannelDisabled(modelId: string | undefined | null): boolean {
+    return (modelId ?? '').trim().toLowerCase() === CHANNEL_MODEL_OFF;
+}
+
+/**
  * Whether a catalogued checkpoint can transcribe anything but English.
  *
  * Picking a non-English recognition language while an English-only model is
