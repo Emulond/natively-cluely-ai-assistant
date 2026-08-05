@@ -257,6 +257,12 @@ export class LocalModelDownloadService {
       startedAt: Date.now(),
       updatedAt: Date.now(),
     });
+    // A download announced itself and then went silent for thirteen minutes:
+    // "starting background download" was the FIRST and LAST line about it. No
+    // progress, no completion, no failure — indistinguishable from the request
+    // being dropped on the floor, and the models stayed uncached with nothing to
+    // explain why. Every state this entry reaches is now logged.
+    console.log(`[LocalModelDownloadService] ${key}: worker spawned, downloading...`);
     worker.on('message', (msg: any) => this.onWorkerMessage(key, msg));
     worker.on('error', (err: Error) => this.onWorkerError(key, err));
     // Worker exit without a `ready` or `error` message: treat as interrupted.
@@ -410,6 +416,10 @@ export class LocalModelDownloadService {
       const after = this.entries.get(key);
       if (!after) return; // cancel fired during the verify
       if (ok) {
+        console.log(
+          `[LocalModelDownloadService] ${key}: complete — files verified on disk ` +
+          `after ${Math.round((Date.now() - (after.startedAt ?? Date.now())) / 1000)}s`,
+        );
         this.terminateWorker(key);
         this.setEntry(key, { ...after, status: 'complete', progress: 100, updatedAt: Date.now() });
       } else {

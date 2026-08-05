@@ -193,7 +193,28 @@ parentPort.on('message', async (msg: any) => {
       return;
     }
     try {
+      // LOG BEFORE THE FIRST SLOW THING, NOT AFTER.
+      //
+      // loadTransformers() is a dynamic ESM import of a very large package plus
+      // the native ONNX Runtime binding, and it was the first statement in this
+      // handler — so a worker that stalled there produced NOTHING. No "Loading",
+      // no error, no trace of any kind. The host saw only `worker=true
+      // ready=false` forever and a pending queue climbing:
+      //
+      //   [LocalWhisperSTT] Cold-starting worker for Xenova/whisper-small
+      //   [LocalWhisperSTT:system] pipeline · pending=7 ... worker=true ready=false
+      //
+      // Two workers, seventy seconds, not one line between them. Every
+      // "the worker never became ready and said nothing" report traces back to
+      // this ordering. An arrival line costs nothing and makes the difference
+      // between "stalled importing transformers" and "stalled loading weights"
+      // visible without guessing.
+      console.log(
+        `[WhisperWorker] init received for ${msg.modelId} — importing @huggingface/transformers...`,
+      );
+      const importT0 = Date.now();
       const { pipeline, env } = await loadTransformers();
+      console.log(`[WhisperWorker] transformers imported in ${Date.now() - importT0}ms`);
 
       env.cacheDir = msg.cacheDir;
       env.allowRemoteModels = true;

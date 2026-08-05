@@ -7237,6 +7237,14 @@ export function initializeIpcHandlers(appState: AppState): void {
         // when a session later ran a model the user thought they had replaced,
         // the log could not answer the first question worth asking: did the
         // change save at all? Now it can.
+        // Rebuild the live STT instances. They are created once and reused, so
+        // without this the change only took effect at the next app launch —
+        // which looked exactly like the setting being ignored.
+        try {
+          await appState.applyLocalWhisperChannelChange();
+        } catch (e: any) {
+          console.warn('[Settings] could not apply channel change immediately:', e?.message ?? e);
+        }
         console.log(
           '[Settings] local Whisper channel models now: ' +
           `splitChannels=${!!sm.get('localWhisperPerChannelEnabled')} ` +

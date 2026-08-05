@@ -4369,6 +4369,37 @@ export class AppState {
    * chain for the next caller, so the chain link swallows the error here and
    * re-throws to THIS caller only.
    */
+  /**
+   * Apply a local-Whisper channel/model change to the LIVE instances.
+   *
+   * STT providers are built once and reused, so a per-channel change made while
+   * the app is running did nothing until the next launch. Observed exactly that:
+   * the setting saved correctly —
+   *
+   *   [Settings] local Whisper channel models now: splitChannels=true mic=off
+   *              system=Xenova/whisper-small
+   *
+   * — and the meeting started ninety seconds later still cold-started TWO
+   * workers, because it reused the providers created at startup when mic was
+   * still a model. Nothing said the change would not take effect, so the only
+   * available conclusion was that the feature did not work.
+   *
+   * Reuses the same reconfigure path a provider switch uses. Skipped mid-meeting:
+   * tearing the pipeline down under a running session would drop audio, and the
+   * change is picked up when that meeting ends.
+   */
+  public async applyLocalWhisperChannelChange(): Promise<void> {
+    if (this.isMeetingActive) {
+      console.log(
+        '[Main] Local Whisper channel settings changed during a meeting — ' +
+        'the running session keeps its current models; the change applies to the next meeting.',
+      );
+      return;
+    }
+    console.log('[Main] Local Whisper channel settings changed — rebuilding STT providers now.');
+    await this.reconfigureSttProvider();
+  }
+
   public async reconfigureSttProvider(): Promise<void> {
     const run = this._sttReconfigureChain.then(
       () => this._doReconfigureSttProvider(),

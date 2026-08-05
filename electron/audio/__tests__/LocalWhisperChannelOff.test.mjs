@@ -152,3 +152,77 @@ describe('the surviving channel gets the whole CPU budget', () => {
     assert.match(workerSrc, /getDirectMLSessionOptions\(msg\.concurrentSessions\)/);
   });
 });
+
+describe('a channel change reaches the running app', () => {
+  test('the setting handler rebuilds the live STT providers', () => {
+    // THE BUG: providers are built once and reused, so a per-channel change
+    // made while the app was running did nothing until the next launch. The
+    // setting saved correctly —
+    //
+    //   [Settings] local Whisper channel models now: splitChannels=true
+    //              mic=off system=Xenova/whisper-small
+    //
+    // — and the meeting ninety seconds later still cold-started TWO workers,
+    // because it reused what startup had created. Nothing said the change
+    // would not apply, so it looked exactly like the feature not working.
+    assert.match(ipcSrc, /await appState\.applyLocalWhisperChannelChange\(\)/);
+    assert.match(mainSrc, /public async applyLocalWhisperChannelChange\(\): Promise<void>/);
+  });
+
+  test('it reuses the provider-switch path rather than inventing one', () => {
+    const body = mainSrc.slice(
+      mainSrc.indexOf('public async applyLocalWhisperChannelChange'),
+      mainSrc.indexOf('public async reconfigureSttProvider'),
+    );
+    assert.match(body, /await this\.reconfigureSttProvider\(\)/);
+  });
+
+  test('a running meeting is not torn down under the user', () => {
+    const body = mainSrc.slice(
+      mainSrc.indexOf('public async applyLocalWhisperChannelChange'),
+      mainSrc.indexOf('public async reconfigureSttProvider'),
+    );
+    assert.match(
+      body,
+      /if \(this\.isMeetingActive\) \{[\s\S]{0,500}?return;/,
+      'rebuilding mid-meeting would drop audio; the change waits for the next one',
+    );
+    assert.match(body, /applies to the next meeting/, 'and it must say so');
+  });
+
+  test('a failure to apply cannot fail the save', () => {
+    assert.match(
+      ipcSrc,
+      /try \{\s*\n\s*await appState\.applyLocalWhisperChannelChange\(\);\s*\n\s*\} catch/,
+      'the setting is already persisted by this point — applying is best-effort',
+    );
+  });
+});
+
+describe('a stalled worker is visible', () => {
+  const workerSrc = read('electron/audio/whisper/whisperWorker.ts');
+  const dlSrc = read('electron/services/LocalModelDownloadService.ts');
+
+  test('the worker logs on arrival, before the first slow call', () => {
+    // loadTransformers() is a dynamic ESM import of a very large package plus
+    // the native ORT binding, and it was the FIRST statement in the init
+    // handler — so a worker stalling there produced nothing at all. Two
+    // workers, seventy seconds, not one line between them, while the host
+    // showed `worker=true ready=false` and a climbing pending queue.
+    const initIdx = workerSrc.indexOf("if (msg.type === 'init')");
+    const logIdx = workerSrc.indexOf('init received for', initIdx);
+    const importIdx = workerSrc.indexOf('await loadTransformers()', initIdx);
+    assert.ok(logIdx > initIdx, 'the worker must announce that init arrived');
+    assert.ok(importIdx > logIdx, 'that line must come BEFORE the import');
+  });
+
+  test('the import duration is reported, so a slow one is measurable', () => {
+    assert.match(workerSrc, /transformers imported in \$\{Date\.now\(\) - importT0\}ms/);
+  });
+
+  test('a background download reports more than its own beginning', () => {
+    // "starting background download" was the first and last line about it.
+    assert.match(dlSrc, /worker spawned, downloading\.\.\./);
+    assert.match(dlSrc, /complete — files verified on disk/);
+  });
+});
