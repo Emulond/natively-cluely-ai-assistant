@@ -47,10 +47,16 @@ describe('final-transcribe watchdog', () => {
   test('an expired task gives its queue slot back', () => {
     // Without this the backpressure limit converts a slow model into a silent
     // channel — which is exactly what shipped.
-    assert.match(
-      source,
-      /armTaskWatchdog[\s\S]{0,1600}?this\.noteTranscribeResolved\(taskId\)/,
-      'the watchdog must release the slot so later speech is still accepted',
+    // The watchdog's own release, and the release path it calls into. The
+    // window is generous because the callback now also declines to blame a slow
+    // model when the session is simply shutting down.
+    const armIdx = source.indexOf('private armTaskWatchdog(');
+    const releaseIdx = source.indexOf('this.noteTranscribeResolved(taskId)', armIdx);
+    const nextMethodIdx = source.indexOf('private shortModelName()', armIdx);
+    assert.ok(releaseIdx > armIdx, 'the watchdog must release the slot');
+    assert.ok(
+      releaseIdx < nextMethodIdx,
+      'and it must do so inside armTaskWatchdog, so later speech is still accepted',
     );
   });
 
@@ -97,7 +103,12 @@ describe('final-transcribe watchdog', () => {
   });
 
   test('a dead worker resets occupancy instead of leaking it', () => {
-    const resets = source.match(/this\.clearAllTaskWatchdogs\(\);\s*\n\s*this\.inFlightTranscribes = 0;/g) ?? [];
+    // Both handlers must clear the watchdogs AND zero the occupancy counter.
+    // Not asserted as adjacent lines: the held-audio buffer is now cleared
+    // between them, and that ordering is not what matters.
+    const resets = source.match(
+      /this\.clearAllTaskWatchdogs\(\);[\s\S]{0,200}?this\.inFlightTranscribes = 0;/g,
+    ) ?? [];
     assert.ok(
       resets.length >= 2,
       'both the worker error and worker exit handlers must clear outstanding tasks',

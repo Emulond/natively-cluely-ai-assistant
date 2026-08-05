@@ -226,3 +226,69 @@ describe('a stalled worker is visible', () => {
     assert.match(dlSrc, /complete — files verified on disk/);
   });
 });
+
+describe('backlogged speech is merged, not discarded', () => {
+  const sttSrc = read('electron/audio/LocalWhisperSTT.ts');
+
+  test('a saturated worker coalesces instead of dropping', () => {
+    // Whisper's encoder has a FIXED 30-second receptive field: every clip is
+    // padded to 30s before encoding, so a 0.8s phrase costs the same pass as a
+    // 25s one. Measured on a 6-core i5-11260H, whisper-small, 10 threads:
+    //
+    //   "Проверка."                    8395ms  (10.0x realtime)
+    //   "Только что-то выразилось..."  6120ms  ( 2.7x realtime)
+    //
+    // Nearly the same wall time for very different amounts of speech. Dropping
+    // a phrase therefore saves NOTHING structural — the next one still pays a
+    // whole pass. Appending it to the clip already waiting is free.
+    assert.match(sttSrc, /this\.coalesceFinal\(audio\);\s*\n\s*return;/);
+    assert.ok(
+      !/dropping a final segment/.test(sttSrc),
+      'the unconditional drop is what threw away 41% of speech',
+    );
+  });
+
+  test('the merged clip stays inside the 30s window', () => {
+    assert.match(sttSrc, /MAX_COALESCED_SAMPLES = 25 \* 16000/);
+    assert.match(
+      sttSrc,
+      /while \(this\.coalesceSamples > LocalWhisperSTT\.MAX_COALESCED_SAMPLES/,
+      'a clip longer than the window cannot be encoded in one pass',
+    );
+  });
+
+  test('past the window the oldest audio goes, and it is reported', () => {
+    // Only here is speech genuinely lost, and it must say so.
+    assert.match(sttSrc, /merged backlog exceeded/);
+    assert.match(sttSrc, /this\.diagDroppedBackpressure\+\+/);
+  });
+
+  test('a freed slot flushes the held audio', () => {
+    assert.match(
+      sttSrc,
+      /this\.inFlightTranscribes = Math\.max\(0, this\.inFlightTranscribes - 1\);\s*\n[\s\S]{0,300}?this\.flushCoalesced\(\);/,
+      'held speech must go out as soon as there is room',
+    );
+  });
+
+  test('the flush respects the same occupancy limit as a normal final', () => {
+    const body = sttSrc.slice(
+      sttSrc.indexOf('private flushCoalesced()'),
+      sttSrc.indexOf('private sendTranscribe('),
+    );
+    assert.match(body, /if \(outstandingFinals >= LocalWhisperSTT\.MAX_INFLIGHT_TRANSCRIBES\) return/);
+    assert.match(body, /if \(this\.coalesceBuffer\.length === 0 \|\| !this\.worker \|\| !this\.workerReady\) return/);
+  });
+
+  test('stopping a meeting sends the held audio rather than binning it', () => {
+    assert.match(
+      sttSrc,
+      /segs\.forEach\(s => this\.dispatchFinal\(s\.samples\)\);\s*\n[\s\S]{0,300}?this\.flushCoalesced\(\);/,
+    );
+  });
+
+  test('a dead worker clears the buffer so it cannot leak into the next session', () => {
+    const clears = sttSrc.match(/this\.coalesceBuffer = \[\];\s*\n\s*this\.coalesceSamples = 0;/g) ?? [];
+    assert.ok(clears.length >= 2, 'both the worker error and exit paths must clear it');
+  });
+});

@@ -374,6 +374,9 @@ export class LocalWhisperSTT extends EventEmitter {
             this.vad = null;
             this.isDrainingFinals = true;
             segs.forEach(s => this.dispatchFinal(s.samples));
+            // Held audio is real speech the user said — send it with the rest
+            // of the drain rather than discarding it on the way out.
+            this.flushCoalesced();
         }
 
         this.resetAgreementState();
@@ -768,22 +771,101 @@ export class LocalWhisperSTT extends EventEmitter {
             // behind an already-saturated worker loses it anyway (it would
             // surface tens of seconds late) AND delays every phrase after it.
             // Fail visibly on the phrase rather than invisibly on the session.
-            this.diagDroppedBackpressure++;
-            console.warn(
-                `[LocalWhisperSTT${this.channelLabel ? ':' + this.channelLabel : ''}] ` +
-                `dropping a final segment — ${outstandingFinals} finals already queued ` +
-                `(inference is slower than speech; use a smaller model or enable GPU)`,
-            );
-            this.reportDegraded(
-                `${this.shortModelName()} is transcribing slower than you are speaking, so phrases are ` +
-                `being skipped. Choose a smaller model in Settings → Audio.`,
-            );
+            // COALESCE INSTEAD OF DROP.
+            //
+            // Whisper's encoder has a fixed 30-second receptive field: every
+            // clip is padded to 30s before it is encoded, so a 0.8s phrase
+            // costs the SAME encoder pass as a 25s one. Measured on a 6-core
+            // i5-11260H with whisper-small, single channel, 10 threads:
+            //
+            //   "Проверка."                    8395ms  (10.0x realtime)
+            //   "Только что-то выразилось..."  6120ms  ( 2.7x realtime)
+            //
+            // Nearly the same wall time for very different amounts of speech —
+            // that flat floor is the padding, not the words.
+            //
+            // Dropping a phrase therefore saves nothing structural: the next
+            // phrase still pays a whole encoder pass. Appending it to the one
+            // already waiting costs NOTHING EXTRA — same single pass — and
+            // keeps the words. Four drops became one combined transcription.
+            //
+            // Capped below the 30s window so the merged clip never exceeds what
+            // Whisper can encode in one go.
+            this.coalesceFinal(audio);
             return;
         }
         if (this.isDrainingFinals) {
             this.drainingFinalsInFlight++;
         }
         this.sendTranscribe(audio, false);
+    }
+
+    /**
+     * Audio that arrived while the worker was saturated, held for the next free
+     * slot instead of being thrown away.
+     *
+     * Whisper pads every clip to a 30-second window before encoding, so the
+     * encoder cost is FLAT regardless of how much speech the clip contains.
+     * That makes dropping a phrase a pure loss — the work saved is zero,
+     * because the next phrase pays the same fixed pass anyway. Merging the
+     * waiting phrases into one clip transcribes all of them for the price of
+     * the one pass that was going to happen regardless.
+     */
+    private coalesceBuffer: Float32Array[] = [];
+    private coalesceSamples = 0;
+    /** 25s at 16kHz — comfortably inside Whisper's 30s window. */
+    private static readonly MAX_COALESCED_SAMPLES = 25 * 16000;
+
+    private coalesceFinal(audio: Float32Array): void {
+        const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+        this.coalesceBuffer.push(audio.slice());
+        this.coalesceSamples += audio.length;
+
+        // Past the window there is genuinely nothing to do but let the oldest
+        // audio go — a clip longer than 30s cannot be encoded in one pass, and
+        // splitting it would reintroduce the per-pass cost this avoids.
+        while (this.coalesceSamples > LocalWhisperSTT.MAX_COALESCED_SAMPLES && this.coalesceBuffer.length > 1) {
+            const dropped = this.coalesceBuffer.shift();
+            this.coalesceSamples -= dropped?.length ?? 0;
+            this.diagDroppedBackpressure++;
+            console.warn(
+                `[LocalWhisperSTT${tag}] merged backlog exceeded ` +
+                `${LocalWhisperSTT.MAX_COALESCED_SAMPLES / 16000}s — dropping the oldest audio in it`,
+            );
+            this.reportDegraded(
+                `${this.shortModelName()} is far enough behind that speech is being lost. ` +
+                `Choose a smaller model in Settings → Audio, or enable GPU acceleration.`,
+            );
+        }
+        console.log(
+            `[LocalWhisperSTT${tag}] worker busy — holding ${(this.coalesceSamples / 16000).toFixed(1)}s ` +
+            `of speech in ${this.coalesceBuffer.length} segment(s) to transcribe together ` +
+            `(one 30s encoder pass covers all of it)`,
+        );
+    }
+
+    /** Send the held audio as ONE clip, if a slot is free and there is any. */
+    private flushCoalesced(): void {
+        if (this.coalesceBuffer.length === 0 || !this.worker || !this.workerReady) return;
+        const outstandingFinals = [...this.taskWatchdogs.keys()]
+            .filter(id => id.startsWith('t')).length;
+        if (outstandingFinals >= LocalWhisperSTT.MAX_INFLIGHT_TRANSCRIBES) return;
+
+        const merged = new Float32Array(this.coalesceSamples);
+        let offset = 0;
+        for (const chunk of this.coalesceBuffer) { merged.set(chunk, offset); offset += chunk.length; }
+        const segments = this.coalesceBuffer.length;
+        this.coalesceBuffer = [];
+        this.coalesceSamples = 0;
+
+        const tag = this.channelLabel ? `:${this.channelLabel}` : '';
+        console.log(
+            `[LocalWhisperSTT${tag}] transcribing ${segments} held segment(s) as one ` +
+            `${(merged.length / 16000).toFixed(1)}s clip`,
+        );
+        this.diagDispatched++;
+        if (this.isDrainingFinals) this.drainingFinalsInFlight++;
+        this.sendTranscribe(merged, false);
     }
 
     private sendTranscribe(audio: Float32Array, streaming: boolean): string | null {
@@ -978,6 +1060,10 @@ export class LocalWhisperSTT extends EventEmitter {
             }
         }
         this.inFlightTranscribes = Math.max(0, this.inFlightTranscribes - 1);
+        // A slot just freed — send whatever was held rather than leaving it to
+        // expire. Safe to call unconditionally; it returns immediately when
+        // there is nothing held or no room.
+        this.flushCoalesced();
     }
 
     private clearAllTaskWatchdogs(): void {
@@ -1167,6 +1253,8 @@ export class LocalWhisperSTT extends EventEmitter {
             // the loop — symptom: transcription stops after 3-4 questions).
             this.clearStreamingWatchdog();
             this.clearAllTaskWatchdogs();
+            this.coalesceBuffer = [];
+            this.coalesceSamples = 0;
             this.inFlightTranscribes = 0;
             this.streamingTaskInFlight = false;
             this.streamingTaskId = null;
@@ -1205,6 +1293,8 @@ export class LocalWhisperSTT extends EventEmitter {
             modelPreloader.recordLoadFailure(this.modelId);
             this.clearStreamingWatchdog();
             this.clearAllTaskWatchdogs();
+            this.coalesceBuffer = [];
+            this.coalesceSamples = 0;
             this.inFlightTranscribes = 0;
             if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
             this.markWorkerGone();
