@@ -57,6 +57,21 @@ export interface GpuProbeResult {
 const PROBE_TIMEOUT_MS = 45_000;
 const CACHE_FILENAME = 'gpu-probe.json';
 
+/**
+ * Bump this whenever the probe's LOGIC changes — what model it opens, which
+ * providers it asks for, how it judges the result.
+ *
+ * Caching only against GPU + driver + ORT version was not enough. The first
+ * version of this probe opened whichever cached .onnx was smallest, which can
+ * be a q8 decoder that DirectML may refuse for reasons unrelated to the
+ * adapter. That produced "no DirectML adapter could create a session". Fixing
+ * the probe to open fp32 encoders and to run a CPU control first changed
+ * nothing on the affected machine, because the old verdict was still cached
+ * against an unchanged GPU and driver — a corrected probe that never gets to
+ * run is not a correction.
+ */
+const PROBE_LOGIC_VERSION = 2;
+
 const VENDOR_NVIDIA = 0x10de;
 const VENDOR_AMD = 0x1002;
 const VENDOR_INTEL = 0x8086;
@@ -234,7 +249,7 @@ async function buildSignature(): Promise<string> {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         ortVersion = require('onnxruntime-node/package.json').version ?? 'unknown';
     } catch { /* keep 'unknown' */ }
-    return `${process.platform}/${process.arch}/ort${ortVersion}/${gpu}`;
+    return `v${PROBE_LOGIC_VERSION}/${process.platform}/${process.arch}/ort${ortVersion}/${gpu}`;
 }
 
 export function readCachedProbe(userDataDir: string, signature: string): GpuProbeResult | null {
@@ -377,7 +392,12 @@ export function getResolvedGpuDevice(): GpuProbeResult | null {
 export function ensureGpuProbe(opts: { userDataDir: string; modelsDir: string }): Promise<GpuProbeResult> {
     if (memoisedProbe) return Promise.resolve(memoisedProbe);
     if (probeInFlight) return probeInFlight;
-    probeInFlight = resolveGpuDevice(opts)
+    probeInFlight = resolveGpuDevice({
+        ...opts,
+        // NATIVELY_ONNX_DEVICE=dml forces a fresh probe past a cached refusal,
+        // so a machine can be re-tested without hunting down the cache file.
+        force: (process.env.NATIVELY_ONNX_DEVICE ?? '').trim().toLowerCase() === 'dml',
+    })
         .catch((e) => ({
             deviceId: null,
             reason: `GPU probe failed outright (${String(e?.message ?? e).slice(0, 200)}) — using CPU`,

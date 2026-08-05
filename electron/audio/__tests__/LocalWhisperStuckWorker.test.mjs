@@ -147,26 +147,105 @@ test('source: worker error handler also resets streaming in-flight state', () =>
 
 test('source: streamingTick arms the watchdog in the dispatch path', () => {
   // The watchdog only helps if it is actually armed when a task is dispatched.
-  // Walk streamingTick and confirm armStreamingWatchdog is called from
-  // within the dispatch path (anywhere in the body — before or after
-  // postMessage is acceptable; the implementation currently arms it BEFORE
-  // postMessage, which is a known minor concern but not the bug under test).
+  //
+  // streamingTick used to call worker.postMessage itself, and this test looked
+  // for that call. It now dispatches through sendTranscribe() so a streaming
+  // pass is counted as worker occupancy like any other — the previous inline
+  // post incremented nothing, while the returning partial decremented the
+  // counter, an unbalanced release that under-counted how busy the worker was.
+  // What must remain true is unchanged: the watchdog is armed on the same
+  // dispatch path as the post.
   const tickBlock = source.match(
     /private\s+streamingTick\s*\(\s*\)\s*:\s*void\s*\{([\s\S]*?)\n\s{4}\}/,
   );
   assert.ok(tickBlock, 'streamingTick method must be locatable');
   const body = tickBlock[1];
   const armIdx = body.search(/armStreamingWatchdog\s*\(\s*\)/);
-  const postIdx = body.search(/worker\.postMessage/);
+  const dispatchIdx = body.search(/sendTranscribe\([^)]*,\s*true\s*\)|worker\.postMessage/);
   assert.ok(armIdx >= 0, 'streamingTick must call armStreamingWatchdog');
-  assert.ok(postIdx >= 0, 'streamingTick must postMessage');
+  assert.ok(dispatchIdx >= 0, 'streamingTick must dispatch a streaming transcribe');
   // The two must be on the same dispatch path (both called, both reachable
   // on the happy path). We don't assert arm > post because either order
   // recovers the loop correctly: the 30s timer is short relative to model
   // cold-start, and clearStreamingWatchdog on partial/final closes it.
   assert.ok(
-    Math.abs(armIdx - postIdx) < 200,
-    'armStreamingWatchdog and worker.postMessage should be on the same dispatch path',
+    Math.abs(armIdx - dispatchIdx) < 600,
+    'armStreamingWatchdog and the dispatch should be on the same path',
+  );
+});
+
+test('source: a streaming dispatch occupies a slot, and releasing it is balanced', () => {
+  // THE BUG: streamingTick posted to the worker directly, so
+  // inFlightTranscribes was never incremented for a streaming pass — but the
+  // returning 'partial' called noteTranscribeResolved(), decrementing a
+  // counter this dispatch never raised.
+  assert.match(
+    source,
+    /this\.streamingTaskId = this\.sendTranscribe\(open\.samples, true\)/,
+    'streaming must dispatch through the counted path',
+  );
+  assert.match(
+    source,
+    /private sendTranscribe\(audio: Float32Array, streaming: boolean\): string \| null/,
+    'sendTranscribe must hand back the taskId the streaming loop tracks',
+  );
+});
+
+test('source: backpressure counts finals only, not live previews', () => {
+  // Now that a streaming pass holds a slot, measuring total occupancy in
+  // dispatchFinal would let a disposable preview push a real phrase off the
+  // queue — trading the transcript for the preview of it.
+  assert.match(
+    source,
+    /const outstandingFinals = \[\.\.\.this\.taskWatchdogs\.keys\(\)\]\s*\n\s*\.filter\(id => id\.startsWith\('t'\)\)\.length/,
+  );
+  assert.match(
+    source,
+    /if \(outstandingFinals >= LocalWhisperSTT\.MAX_INFLIGHT_TRANSCRIBES\)/,
+  );
+});
+
+test('source: a busy worker does not push the streaming loop into backoff', () => {
+  // THE BUG: during continuous speech the worker is nearly always mid-final,
+  // so every streaming tick counted as a stall. Three stalls doubled the
+  // interval, then doubled again, up to 12s — and LocalAgreement-2 needs TWO
+  // passes over a segment before it emits anything, which at that interval
+  // never happens. A whole session produced:
+  //
+  //   latency · first-partial: n=0 · final: n=10 p50=1939ms p95=4211ms
+  //
+  // Not one live partial, so every word waited for its final.
+  assert.match(
+    source,
+    /private recordStreamingStall\(reason: 'idle' \| 'busy' = 'idle'\): void/,
+    'stall reasons must be distinguishable',
+  );
+  assert.match(
+    source,
+    /if \(reason === 'busy'\) \{\s*\n\s*this\.streamingNextDelayMs = this\.streamingIntervalBaseMs;\s*\n\s*return;/,
+    'a busy worker must reset to the base interval, never escalate the backoff',
+  );
+  // Both occupancy checks must report 'busy'; an 'idle' there reintroduces it.
+  assert.match(source, /if \(this\.streamingTaskInFlight\) \{ this\.recordStreamingStall\('busy'\); return; \}/);
+  assert.match(source, /if \(this\.inFlightTranscribes > 0\) \{ this\.recordStreamingStall\('busy'\); return; \}/);
+});
+
+test('source: the GPU probe cache is keyed on the probe logic, not just hardware', () => {
+  // A corrected probe that never runs is not a correction. The first probe
+  // opened whichever cached .onnx was smallest — often a q8 decoder DirectML
+  // may refuse for reasons unrelated to the adapter — and returned "no
+  // DirectML adapter could create a session". Fixing it to open fp32 encoders
+  // changed nothing on the affected machine: the old verdict was still cached
+  // against an unchanged GPU and driver.
+  const probeSrc = fs.readFileSync(
+    path.resolve(__dirname, '../whisper/gpuProbe.ts'),
+    'utf8',
+  );
+  assert.match(probeSrc, /const PROBE_LOGIC_VERSION = \d+/);
+  assert.match(
+    probeSrc,
+    /return `v\$\{PROBE_LOGIC_VERSION\}\//,
+    'the cache signature must include the probe logic version',
   );
 });
 

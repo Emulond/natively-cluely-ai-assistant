@@ -534,11 +534,11 @@ export class LocalWhisperSTT extends EventEmitter {
         // VAD isn't currently in a speech segment.
         if (!this.vad.isInSpeech()) { this.recordStreamingStall(); return; }
         // Don't stack streaming requests — wait for the previous one to finish.
-        if (this.streamingTaskInFlight) { this.recordStreamingStall(); return; }
+        if (this.streamingTaskInFlight) { this.recordStreamingStall('busy'); return; }
         // Real occupancy check. A streaming pass is a disposable live preview,
         // so when the worker is already busy the right move is to skip this
         // tick entirely rather than lengthen its queue.
-        if (this.inFlightTranscribes > 0) { this.recordStreamingStall(); return; }
+        if (this.inFlightTranscribes > 0) { this.recordStreamingStall('busy'); return; }
 
         const open = this.vad.peekOpenSegment();
         if (!open || open.durationMs < this.streamingMinAudioMs) {
@@ -551,17 +551,37 @@ export class LocalWhisperSTT extends EventEmitter {
         this.streamingNextDelayMs = this.streamingIntervalBaseMs;
 
         this.streamingTaskInFlight = true;
-        const taskId = `s${++this.taskCounter}`;
-        this.streamingTaskId = taskId;
-        const copy = open.samples.slice();
         this.armStreamingWatchdog();
-        this.worker.postMessage(
-            { type: 'transcribe', taskId, audio: copy, language: this.language, streaming: true },
-            [copy.buffer]
-        );
+        // Dispatch through the shared path so a streaming pass is COUNTED as
+        // worker occupancy like any other. It posts directly before, which meant
+        // the partial's noteTranscribeResolved() decremented a counter this
+        // dispatch never incremented — an unbalanced release that quietly
+        // under-counted how busy the worker really was.
+        this.streamingTaskId = this.sendTranscribe(open.samples, true);
     }
 
-    private recordStreamingStall(): void {
+    private recordStreamingStall(reason: 'idle' | 'busy' = 'idle'): void {
+        // A BUSY stall is not the same event as an IDLE one, and treating them
+        // alike is why live partials stopped appearing entirely.
+        //
+        // During continuous speech the worker is nearly always mid-final, so
+        // every streaming tick hit the occupancy check and counted as a stall.
+        // Three of those doubled the interval, then doubled again, up to 12
+        // seconds — and LocalAgreement-2 needs TWO passes over a segment before
+        // it will emit anything, which at that interval never happens. The
+        // telemetry says it plainly:
+        //
+        //   [LocalWhisperSTT/whisper-tiny:mic] latency · first-partial: n=0
+        //     · final: n=10 p50=1939ms p95=4211ms
+        //
+        // Not one partial in a whole session, so every word waited for its
+        // final. Backing off is right when there is nothing to transcribe; it is
+        // exactly wrong when there is a queue, because the queue is about to
+        // clear and we want the next tick ready for it.
+        if (reason === 'busy') {
+            this.streamingNextDelayMs = this.streamingIntervalBaseMs;
+            return;
+        }
         this.streamingStallCount++;
         // After 3 consecutive stalls, exponentially back off so we stop
         // spinning while the worker is processing a slow model. Reset only
@@ -735,7 +755,15 @@ export class LocalWhisperSTT extends EventEmitter {
             return;
         }
 
-        if (this.inFlightTranscribes >= LocalWhisperSTT.MAX_INFLIGHT_TRANSCRIBES) {
+        // Count only outstanding FINALS. Now that a streaming pass occupies a
+        // slot too, measuring total occupancy here would let a disposable live
+        // preview push a real phrase off the queue — trading the transcript for
+        // the preview of it, which is exactly backwards. Task ids carry their
+        // kind ('t' final, 's' streaming) and the watchdog map holds precisely
+        // the unresolved ones.
+        const outstandingFinals = [...this.taskWatchdogs.keys()]
+            .filter(id => id.startsWith('t')).length;
+        if (outstandingFinals >= LocalWhisperSTT.MAX_INFLIGHT_TRANSCRIBES) {
             // Dropping a final loses a phrase, which is bad — but queueing it
             // behind an already-saturated worker loses it anyway (it would
             // surface tens of seconds late) AND delays every phrase after it.
@@ -743,7 +771,7 @@ export class LocalWhisperSTT extends EventEmitter {
             this.diagDroppedBackpressure++;
             console.warn(
                 `[LocalWhisperSTT${this.channelLabel ? ':' + this.channelLabel : ''}] ` +
-                `dropping a final segment — ${this.inFlightTranscribes} transcriptions already queued ` +
+                `dropping a final segment — ${outstandingFinals} finals already queued ` +
                 `(inference is slower than speech; use a smaller model or enable GPU)`,
             );
             this.reportDegraded(
@@ -758,8 +786,8 @@ export class LocalWhisperSTT extends EventEmitter {
         this.sendTranscribe(audio, false);
     }
 
-    private sendTranscribe(audio: Float32Array, streaming: boolean): void {
-        if (!this.worker) return;
+    private sendTranscribe(audio: Float32Array, streaming: boolean): string | null {
+        if (!this.worker) return null;
         const taskId = `${streaming ? 's' : 't'}${++this.taskCounter}`;
         const copy = audio.slice();
         this.inFlightTranscribes++;
@@ -768,6 +796,7 @@ export class LocalWhisperSTT extends EventEmitter {
             { type: 'transcribe', taskId, audio: copy, language: this.language, streaming },
             [copy.buffer]
         );
+        return taskId;
     }
 
     /**
