@@ -100,9 +100,23 @@ export function buildWorkerInitMessage(
     // per-file byte totals it observes during the download. The size is a
     // UX nicety for the progress bar, never required for the download itself,
     // so a failure here must NEVER prevent the worker from starting.
+    const extraDtypes = opts?.forDownload ? resolveExtraDownloadDtypes(gpuDeviceIdForDownload()) : undefined;
     let expectedBytes = 0;
     try {
-        const n = Number(getModelSizeBytes(modelId)) * dtypeSizeFactor(dtype);
+        // The extra GPU precision is part of the SAME download, so it has to be
+        // part of the same denominator. Without this the bar reached 100% when
+        // the mixed set finished and then kept fetching ~484MB more with no
+        // indication — a download that looks finished but is not is worse than a
+        // slow one, because the natural response is to close the app, which
+        // leaves the model half-fetched and reported "not cached" at next start.
+        //
+        // 1.8x is deliberately BELOW the true ratio (whisper-small: 510MB mixed
+        // + 484MB fp16 ≈ 1.95x). Over-estimating cannot self-correct — the bar
+        // would stop at ~90% and vanish — while under-estimating just means the
+        // observed total takes over partway through, which is smooth. Same
+        // reasoning as dtypeSizeFactor above.
+        const extraFactor = extraDtypes && extraDtypes.length > 0 ? 1.8 : 1.0;
+        const n = Number(getModelSizeBytes(modelId)) * dtypeSizeFactor(dtype) * extraFactor;
         if (Number.isFinite(n) && n > 0) expectedBytes = Math.round(n);
     } catch {
         expectedBytes = 0;
@@ -147,7 +161,7 @@ export function buildWorkerInitMessage(
         gpuDeviceId,
         gpuQuantizedOk,
         gpuReason,
-        extraDtypes: opts?.forDownload ? resolveExtraDownloadDtypes(gpuDeviceId) : undefined,
+        extraDtypes,
         concurrentSessions: resolveActiveWhisperChannelCount(),
     };
 }
@@ -177,6 +191,17 @@ export function resolveActiveWhisperChannelCount(): number {
         // Settings unreachable (test contexts) — assume both, which is the
         // conservative direction: fewer threads each, never oversubscribed.
         return 2;
+    }
+}
+
+/** The probed adapter, read on its own so expectedBytes can be sized before the
+ *  main probe block below runs. Same source, no second probe. */
+function gpuDeviceIdForDownload(): number | null {
+    try {
+        const { getResolvedGpuDevice } = require('./gpuProbe');
+        return getResolvedGpuDevice()?.deviceId ?? null;
+    } catch {
+        return null;
     }
 }
 

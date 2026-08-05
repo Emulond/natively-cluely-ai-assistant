@@ -256,9 +256,13 @@ describe('int8 is proven separately from float', () => {
     assert.match(cfg, /return \['fp16'\]/);
     assert.match(
       cfg,
-      /extraDtypes: opts\?\.forDownload \? resolveExtraDownloadDtypes\(gpuDeviceId\) : undefined/,
+      /const extraDtypes = opts\?\.forDownload \? resolveExtraDownloadDtypes\(gpuDeviceIdForDownload\(\)\) : undefined/,
       'extraDtypes must be opt-in per call, never set on the meeting path',
     );
+    // The extra precision is part of the same download, so it must be part of
+    // the same denominator — a bar that reads 100% while 484MB is still coming
+    // invites the user to close the app and leave the model half-fetched.
+    assert.match(cfg, /const extraFactor = extraDtypes && extraDtypes\.length > 0 \? 1\.8 : 1\.0/);
     assert.match(
       cfg,
       /if \(gpuDeviceId === null \|\| gpuDeviceId === undefined\) return undefined/,
