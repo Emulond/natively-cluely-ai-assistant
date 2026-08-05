@@ -292,3 +292,60 @@ describe('backlogged speech is merged, not discarded', () => {
     assert.ok(clears.length >= 2, 'both the worker error and exit paths must clear it');
   });
 });
+
+describe('the GPU precision is part of a complete download', () => {
+  const svcSrc = read('electron/services/LocalModelDownloadService.ts');
+  const mmSrc = read('electron/audio/whisper/modelManager.ts');
+  const workerSrc = read('electron/audio/whisper/whisperWorker.ts');
+
+  test('a model missing its GPU precision does not count as cached', () => {
+    // THE TRAP: the settings panel renders Install only while a model is NOT
+    // available — `{!isAvailable && !isDownloading && (<button>Install</button>)}`
+    // — and start() short-circuits for a model reported cached. So once the
+    // primary files landed, the model was marked available, the button
+    // disappeared, and the fp16 files could never be fetched by ANY route.
+    // After several deliberate re-downloads the folder still held only:
+    //   encoder_model.onnx 336.5MB, decoder_model_merged_quantized.onnx 149.5MB
+    assert.match(
+      svcSrc,
+      /if \(extra && extra\.length > 0 && !mm\.isGpuPrecisionCached\(modelId as any\)\) return false;/,
+    );
+  });
+
+  test('the panel really does hide Install for an available model', () => {
+    // The premise above, pinned — if this ever changes, the coupling above
+    // stops being load-bearing and should be revisited.
+    assert.match(panelSrc, /\{!isAvailable && !isDownloading && \(/);
+  });
+
+  test('it checks both decoder layouts and either is enough', () => {
+    assert.match(mmSrc, /export function isGpuPrecisionCached/);
+    assert.match(
+      mmSrc,
+      /return has\('decoder_model_merged_fp16\.onnx'\)\s*\n\s*\|\| \(has\('decoder_model_fp16\.onnx'\) && has\('decoder_with_past_model_fp16\.onnx'\)\)/,
+    );
+    assert.match(mmSrc, /if \(!has\('encoder_model_fp16\.onnx'\)\) return false/);
+  });
+
+  test('a model with no fp16 build is not stranded forever', () => {
+    // Demanding a file that does not exist would leave the model permanently
+    // "not downloaded", re-attempting the same missing fetch every launch.
+    assert.match(mmSrc, /NO_GPU_PRECISION_MARKER = '\.no-fp16'/);
+    assert.match(
+      mmSrc,
+      /if \(fs\.existsSync\(path\.join\(onnxDir, NO_GPU_PRECISION_MARKER\)\)\) return true;/,
+    );
+    // And the worker writes it when the fetch proves impossible.
+    assert.match(workerSrc, /_pathMark\.join\(dir, '\.no-fp16'\)/);
+  });
+
+  test('machines with no usable GPU are unaffected', () => {
+    // resolveExtraDownloadDtypes returns undefined without a probed adapter,
+    // so the extra requirement never applies and nothing extra is demanded.
+    assert.match(svcSrc, /const extra = cfg\.resolveExtraDownloadDtypes\(gpuDeviceIdForCacheCheck\(\)\)/);
+    assert.match(
+      cfgSrc,
+      /if \(gpuDeviceId === null \|\| gpuDeviceId === undefined\) return undefined/,
+    );
+  });
+});

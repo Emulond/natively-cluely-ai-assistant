@@ -624,17 +624,48 @@ export class LocalModelDownloadService {
  * (all state lives in the service). It only knows how to spawn a worker,
  * build the init message, and verify / clean disk.
  */
+/** The probed adapter, or null. Same source the worker init message reads. */
+function gpuDeviceIdForCacheCheck(): number | null {
+  try {
+    const { getResolvedGpuDevice } = require('../audio/whisper/gpuProbe') as typeof import('../audio/whisper/gpuProbe');
+    return getResolvedGpuDevice()?.deviceId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function createWhisperDownloadProvider(): LocalModelDownloadProvider {
   return {
     name: 'whisper',
     isModelCached(modelId: string): boolean {
-      const { isModelCached } = require('../audio/whisper/modelManager') as typeof import('../audio/whisper/modelManager');
-      const { resolveInferenceConfig: rIC } = require('../audio/whisper/inferenceConfig') as typeof import('../audio/whisper/inferenceConfig');
+      const mm = require('../audio/whisper/modelManager') as typeof import('../audio/whisper/modelManager');
+      const cfg = require('../audio/whisper/inferenceConfig') as typeof import('../audio/whisper/inferenceConfig');
       try {
-        const { dtype } = rIC();
-        return isModelCached(modelId as any, dtype);
+        const { dtype } = cfg.resolveInferenceConfig();
+        if (!mm.isModelCached(modelId as any, dtype)) return false;
+        // The GPU precision is PART of a complete download, not a bonus.
+        //
+        // The settings panel renders an Install button only while a model is
+        // NOT available, and start() short-circuits for a model this function
+        // calls cached. So the moment the primary files landed, the model was
+        // marked available, the button vanished, and the fp16 files could never
+        // be fetched — by any route, however many times the user re-downloaded.
+        // That is exactly what happened: after several deliberate re-downloads
+        // the folder still held only
+        //
+        //   encoder_model.onnx 336.5MB, decoder_model_merged_quantized.onnx 149.5MB
+        //
+        // and the worker fell back to the CPU every time for want of a file the
+        // app had made it impossible to obtain.
+        //
+        // isGpuPrecisionCached() honours a marker the worker writes when a
+        // repository publishes no fp16, so such a model is not stranded at
+        // "not downloaded" forever.
+        const extra = cfg.resolveExtraDownloadDtypes(gpuDeviceIdForCacheCheck());
+        if (extra && extra.length > 0 && !mm.isGpuPrecisionCached(modelId as any)) return false;
+        return true;
       } catch {
-        return isModelCached(modelId as any);
+        return mm.isModelCached(modelId as any);
       }
     },
     deletePartial(modelId: string): void {

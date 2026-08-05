@@ -639,6 +639,20 @@ parentPort.on('message', async (msg: any) => {
             `(${extraErr?.message ?? extraErr}) — the model itself downloaded fine; ` +
             'GPU inference will use whichever precision is present.',
           );
+          // Record it, so "downloaded" stops demanding a file that does not
+          // exist. Without this the model would read as incomplete forever and
+          // re-attempt the same missing fetch on every launch.
+          try {
+            const _fsMark = require('fs');
+            const _pathMark = require('path');
+            const parts = String(msg.modelId).split('/');
+            const dir = _pathMark.join(String(msg.cacheDir), parts[0] ?? '', parts[1] ?? '', 'onnx');
+            _fsMark.mkdirSync(dir, { recursive: true });
+            _fsMark.writeFileSync(
+              _pathMark.join(dir, '.no-fp16'),
+              'This model has no fp16 build; GPU inference will use another precision.\n',
+            );
+          } catch { /* best-effort — the cost is one retry next launch */ }
         }
       }
 

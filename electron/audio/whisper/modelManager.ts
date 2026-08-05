@@ -286,6 +286,58 @@ function expectedOnnxFiles(
 }
 
 /**
+ * Marker written when a model has no fp16 build to fetch.
+ *
+ * Without it, requiring fp16 for "downloaded" would strand any model whose
+ * repository does not publish one at "not downloaded" forever, re-attempting
+ * on every launch.
+ */
+const NO_GPU_PRECISION_MARKER = '.no-fp16';
+
+/**
+ * Whether the GPU precision (fp16) is present — or known not to exist.
+ *
+ * WHY THIS IS PART OF "DOWNLOADED": the settings panel shows an Install button
+ * only while a model is NOT available, and the download service short-circuits
+ * a start() for a model it considers cached. So the moment the primary files
+ * landed, the model was marked available, the button disappeared, and the fp16
+ * files could never be fetched — by any route, however many times the user
+ * tried. That is why re-downloading never produced them:
+ *
+ *   present: encoder_model.onnx 336.5MB, decoder_model_merged_quantized.onnx 149.5MB
+ *   (no fp16 files at all, after several deliberate re-downloads)
+ *
+ * Counting fp16 as part of the download makes the model read as incomplete
+ * until it really is complete, which is what puts the button back and what lets
+ * the startup auto-download top it up unprompted.
+ */
+export function isGpuPrecisionCached(modelId: WhisperModelId): boolean {
+  const onnxDir = path.join(getModelsDir(), modelIdToCacheDir(modelId), 'onnx');
+  try {
+    if (fs.existsSync(path.join(onnxDir, NO_GPU_PRECISION_MARKER))) return true;
+  } catch { /* fall through */ }
+  const has = (name: string) => {
+    try { return fs.statSync(path.join(onnxDir, name)).size > 0; } catch { return false; }
+  };
+  if (!has('encoder_model_fp16.onnx')) return false;
+  // A model ships EITHER a merged decoder OR the split pair.
+  return has('decoder_model_merged_fp16.onnx')
+    || (has('decoder_model_fp16.onnx') && has('decoder_with_past_model_fp16.onnx'));
+}
+
+/** Record that this model publishes no fp16 build, so it stops being demanded. */
+export function markGpuPrecisionUnavailable(modelId: string): void {
+  try {
+    const onnxDir = path.join(getModelsDir(), modelId, 'onnx');
+    fs.mkdirSync(onnxDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(onnxDir, NO_GPU_PRECISION_MARKER),
+      'This model has no fp16 build; GPU inference will use another precision.\n',
+    );
+  } catch { /* best-effort — the cost is one retry next launch */ }
+}
+
+/**
  * Returns true when the cache contains the ONNX files the active dtype will
  * actually load. When `dtype` is omitted (legacy callers), falls back to a
  * directory-non-empty check — preserves the previous contract.
