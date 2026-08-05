@@ -51,23 +51,89 @@ jobs:
       #
       # Defender's real-time scanner inspects every one of the ~100k small files
       # npm writes and every artifact the Rust and packaging steps produce, and
-      # it is the single biggest avoidable cost on a Windows runner. The runner
-      # is a throwaway VM building our own source, so scanning it buys nothing.
+      # it is the single biggest avoidable cost on a Windows runner. It is on
+      # because GitHub's Windows images ship stock Windows, not because anything
+      # here needs it: this is a throwaway VM compiling our own public source,
+      # and the Linux and macOS runners in this same repo scan nothing at all.
       #
-      # continue-on-error: a runner image where this is unavailable should build
-      # slowly, not fail.
-      - name: Exempt the build from Defender's real-time scanner
+      # So it goes off entirely — every scanning mode, not just exclusions. The
+      # exclusions are kept as well, because Tamper Protection can veto the
+      # global switches on some images while still honouring exclusions; that
+      # way the slow path is "some scanning" rather than "all scanning".
+      #
+      # continue-on-error, and each call is individually tolerant: a runner image
+      # that refuses one of these should build slower, never fail. The
+      # verification block at the end prints what actually took effect, so the
+      # log says which it was instead of leaving us to guess.
+      - name: Disable Windows Defender and other scanners
         shell: pwsh
         continue-on-error: true
         run: |
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-          Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP"
-          Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\npm-cache"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          foreach ($p in 'node.exe','npm.exe','rustc.exe','cargo.exe','link.exe','cl.exe','7z.exe') {
-            Add-MpPreference -ExclusionProcess $p
+          $ErrorActionPreference = 'Continue'
+
+          # Global off switches — the ones that matter.
+          $prefs = @{
+            DisableRealtimeMonitoring     = $true   # the file-by-file scanner
+            DisableBehaviorMonitoring     = $true
+            DisableIOAVProtection         = $true   # scans downloaded files (npm, cargo, models)
+            DisableScriptScanning         = $true
+            DisableArchiveScanning        = $true   # every .tgz npm unpacks
+            DisableIntrusionPreventionSystem = $true
+            DisableScanningNetworkFiles   = $true
+            DisableRemovableDriveScanning = $true
+            MAPSReporting                 = 'Disabled'
+            SubmitSamplesConsent          = 'NeverSend'
           }
-          Write-Host "Defender exclusions applied"
+          # Splatting, because PowerShell cannot take a parameter NAME from a
+          # variable — `Set-MpPreference -$k $value` is a syntax error, and each
+          # setting is applied separately so one refusal does not lose the rest.
+          foreach ($k in @($prefs.Keys)) {
+            $splat = @{ $k = $prefs[$k] }
+            try {
+              Set-MpPreference @splat -ErrorAction Stop
+              Write-Host "  off: $k"
+            } catch {
+              Write-Host "  BLOCKED: $k - $($_.Exception.Message)"
+            }
+          }
+
+          # Exclusions as a fallback for images where Tamper Protection vetoes
+          # the switches above.
+          foreach ($p in @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP,
+                           "$env:LOCALAPPDATA\npm-cache", "$env:USERPROFILE\.cargo")) {
+            try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch {}
+          }
+          foreach ($p in 'node.exe','npm.exe','rustc.exe','cargo.exe','link.exe','cl.exe','7z.exe','electron-builder.exe') {
+            try { Add-MpPreference -ExclusionProcess $p -ErrorAction Stop } catch {}
+          }
+
+          # SmartScreen inspects executables as they are produced and launched.
+          # The policy key does not exist on a stock image, so create it first
+          # rather than assuming Set-ItemProperty can write into nothing.
+          $ssKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+          try {
+            if (-not (Test-Path $ssKey)) { New-Item -Path $ssKey -Force | Out-Null }
+            New-ItemProperty -Path $ssKey -Name 'EnableSmartScreen' -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Host "  off: SmartScreen"
+          } catch { Write-Host "  BLOCKED: SmartScreen - $($_.Exception.Message)" }
+
+          # Indexing and prefetch both walk files we are actively writing.
+          foreach ($svc in 'WSearch','SysMain') {
+            try { Stop-Service $svc -Force -ErrorAction Stop; Write-Host "  stopped: $svc" } catch {}
+          }
+
+          # Say what actually happened rather than assuming it worked.
+          try {
+            $s = Get-MpComputerStatus
+            Write-Host "--- Defender status after changes ---"
+            Write-Host "  RealTimeProtectionEnabled : $($s.RealTimeProtectionEnabled)"
+            Write-Host "  IoavProtectionEnabled     : $($s.IoavProtectionEnabled)"
+            Write-Host "  BehaviorMonitorEnabled    : $($s.BehaviorMonitorEnabled)"
+            Write-Host "  IsTamperProtected         : $($s.IsTamperProtected)"
+            if ($s.RealTimeProtectionEnabled) {
+              Write-Host "::warning::Real-time scanning is STILL ON (Tamper Protection). Exclusions are doing the work instead."
+            }
+          } catch { Write-Host "Get-MpComputerStatus unavailable — Defender may not be present at all." }
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
