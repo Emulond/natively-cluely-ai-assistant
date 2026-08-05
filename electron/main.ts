@@ -1369,6 +1369,20 @@ export class AppState {
       try {
         const { CredentialsManager } = require('./services/CredentialsManager');
         if (CredentialsManager.getInstance().getSttProvider() === 'local-whisper') {
+          // Find out — in a child process, where a native DirectML abort is
+          // survivable — whether a GPU can be used, well before any meeting
+          // asks. Fire-and-forget: workers that spawn before it settles run on
+          // the CPU, which is the behaviour we already ship. See gpuProbe.ts.
+          try {
+            const { ensureGpuProbe } = require('./audio/whisper/gpuProbe');
+            const { getModelsDir } = require('./audio/whisper/modelManager');
+            ensureGpuProbe({
+              userDataDir: app.getPath('userData'),
+              modelsDir: getModelsDir(),
+            }).catch((e: any) => console.warn('[Main] GPU probe failed:', e?.message ?? e));
+          } catch (e: any) {
+            console.warn('[Main] GPU probe could not start:', e?.message ?? e);
+          }
           const { isModelCached, MODEL_CATALOG_IDS } = require('./audio/whisper/modelManager');
           const { modelPreloader } = require('./audio/whisper/modelPreloader');
           const { resolveInferenceConfig } = require('./audio/whisper/inferenceConfig');

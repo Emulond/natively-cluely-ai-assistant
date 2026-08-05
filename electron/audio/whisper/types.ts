@@ -68,6 +68,15 @@ export interface WorkerInitMessage {
   // sibling `*.onnx_data` weight files of external-data checkpoints get fetched.
   // See WhisperModelInfo.externalDataFormat for the full rationale.
   useExternalDataFormat?: boolean | Record<string, boolean>;
+  // DirectML adapter index that a child-process probe has already PROVEN can
+  // create a session on this machine (see gpuProbe.ts), or null/undefined for
+  // CPU. The worker never decides this for itself: a DirectML failure is a
+  // native abort, so the only safe place to find out is a process whose death
+  // the app can survive.
+  gpuDeviceId?: number | null;
+  // Human-readable explanation of that choice, logged verbatim by the worker so
+  // "why is it on the CPU / the wrong GPU" is answerable from a log alone.
+  gpuReason?: string;
 }
 export interface WorkerTranscribeMessage {
   type: 'transcribe';

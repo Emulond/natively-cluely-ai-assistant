@@ -115,6 +115,22 @@ export function buildWorkerInitMessage(modelId: string): WorkerInitMessage {
     } catch {
         useExternalDataFormat = undefined;
     }
+    // Whichever DirectML adapter the startup probe proved usable, or null. The
+    // probe runs in a child process precisely so that this lookup can never be
+    // the thing that crashes a meeting — by the time it is read, the dangerous
+    // part already happened somewhere expendable.
+    let gpuDeviceId: number | null = null;
+    let gpuReason = 'GPU probe has not finished yet — starting on CPU';
+    try {
+        const { getResolvedGpuDevice } = require('./gpuProbe');
+        const probe = getResolvedGpuDevice();
+        if (probe) {
+            gpuDeviceId = probe.deviceId;
+            gpuReason = probe.reason;
+        }
+    } catch {
+        gpuReason = 'GPU probe unavailable — using CPU';
+    }
     return {
         type: 'init',
         modelId,
@@ -123,6 +139,8 @@ export function buildWorkerInitMessage(modelId: string): WorkerInitMessage {
         dtype,
         expectedBytes,
         useExternalDataFormat,
+        gpuDeviceId,
+        gpuReason,
     };
 }
 

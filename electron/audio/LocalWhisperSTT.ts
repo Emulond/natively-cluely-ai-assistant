@@ -737,6 +737,10 @@ export class LocalWhisperSTT extends EventEmitter {
                 `dropping a final segment — ${this.inFlightTranscribes} transcriptions already queued ` +
                 `(inference is slower than speech; use a smaller model or enable GPU)`,
             );
+            this.reportDegraded(
+                `${this.shortModelName()} is transcribing slower than you are speaking, so phrases are ` +
+                `being skipped. Choose a smaller model in Settings → Audio.`,
+            );
             return;
         }
         if (this.isDrainingFinals) {
@@ -802,11 +806,44 @@ export class LocalWhisperSTT extends EventEmitter {
                 `(model=${this.modelId}) — releasing its queue slot so later speech is ` +
                 `still accepted. This model is too slow for real-time on this machine.`,
             );
+            this.reportDegraded(
+                `${this.shortModelName()} did not finish transcribing a ${audioSeconds.toFixed(1)}s ` +
+                `phrase within ${Math.round(budget / 1000)}s. Choose a smaller model in Settings → Audio.`,
+            );
             this.noteTranscribeResolved(taskId);
         }, budget);
         if (typeof timer.unref === 'function') timer.unref();
         this.taskWatchdogs.set(taskId, timer);
     }
+
+    private shortModelName(): string {
+        return this.modelId.split('/').pop() ?? this.modelId;
+    }
+
+    /**
+     * Tell the user their transcription is degraded, through the same channel
+     * every other STT provider uses for failures.
+     *
+     * This gap is the difference between "Natively is broken" and "this model
+     * is too slow for this machine". A cloud provider that stops working emits
+     * an error and the meeting UI shows it. Local Whisper starving on its own
+     * queue emitted NOTHING — the log filled with dropped segments while the
+     * overlay showed a normal, working meeting that simply never produced a
+     * word. Silence is the worst possible way to report a fault, because the
+     * user cannot tell it apart from having nothing to say.
+     *
+     * Rate-limited: one report per interval per channel. Backpressure drops
+     * arrive several times a minute and each one is the same news.
+     */
+    private reportDegraded(message: string): void {
+        const now = Date.now();
+        if (now - this.lastDegradedReportAt < LocalWhisperSTT.DEGRADED_REPORT_INTERVAL_MS) return;
+        this.lastDegradedReportAt = now;
+        this.emit('error', new Error(message));
+    }
+
+    private lastDegradedReportAt = 0;
+    private static readonly DEGRADED_REPORT_INTERVAL_MS = 20000;
 
     private taskWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
     /**

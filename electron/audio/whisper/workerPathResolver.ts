@@ -35,11 +35,26 @@ export function findFirstExistingPath(
 }
 
 export function resolveWhisperWorkerPath(): string {
+    return resolveWhisperScriptPath('whisperWorker.js');
+}
+
+/**
+ * Same resolution for the DirectML probe child, which is launched as a
+ * standalone script rather than a Worker. It sits beside whisperWorker.js and
+ * needs the identical asar → asar.unpacked rewrite: it requires
+ * onnxruntime-node, whose native binding cannot be loaded from inside an
+ * archive.
+ */
+export function resolveGpuProbeChildPath(): string {
+    return resolveWhisperScriptPath('gpuProbeChild.js');
+}
+
+function resolveWhisperScriptPath(filename: string): string {
     let resolvedPath = findFirstExistingPath([
-        path.join(__dirname, 'whisperWorker.js'),
-        path.join(__dirname, 'whisper', 'whisperWorker.js'),
-        path.join(__dirname, '..', 'audio', 'whisper', 'whisperWorker.js'),
-        path.join(__dirname, 'audio', 'whisper', 'whisperWorker.js'),
+        path.join(__dirname, filename),
+        path.join(__dirname, 'whisper', filename),
+        path.join(__dirname, '..', 'audio', 'whisper', filename),
+        path.join(__dirname, 'audio', 'whisper', filename),
     ]);
     if (resolvedPath.includes('app.asar') && !resolvedPath.includes('app.asar.unpacked')) {
         resolvedPath = resolvedPath.replace('app.asar', 'app.asar.unpacked');

@@ -16,7 +16,7 @@
  */
 import { parentPort } from 'worker_threads';
 import { WhisperProgressAggregator } from './whisperProgressAggregator';
-import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
+import { getBoundedOnnxSessionOptions, getDirectMLSessionOptions } from '../../utils/onnxThreadConfig';
 import { RECOGNITION_LANGUAGES } from '../../config/languages';
 
 // The host sends the shared RECOGNITION_LANGUAGES key ('russian', 'english-us',
@@ -285,13 +285,20 @@ parentPort.on('message', async (msg: any) => {
       // that binding, so DirectML is the only GPU path on Windows regardless of
       // GPU vendor. DirectML runs over DX12 and drives NVIDIA/AMD/Intel alike.
       //
-      // WHICH ADAPTER MATTERS. On a laptop, DirectML's default adapter 0 is
-      // typically the integrated GPU, which shares system RAM — handing it a
-      // 352MB fp32 encoder is how the earlier device='dml' attempt took the
-      // whole app down at startup (native abort during init: no JS throw, so a
-      // try/catch cannot rescue it). A discrete GPU with its own VRAM is a very
-      // different proposition. ORT's DmlExecutionProviderOption accepts
-      // `deviceId`, so the adapter is selectable — set NATIVELY_ONNX_DEVICE_ID.
+      // THE WORKER NO LONGER DECIDES. Two earlier designs picked an adapter
+      // here — first `device: 'dml'`, then an automatic ladder — and both took
+      // the app down at launch. A DirectML failure is a native abort: no JS
+      // throw, so no try/catch and no fallback, and a sentinel written moments
+      // earlier can lose the race to disk. The decision now happens in a
+      // throwaway child process before any meeting starts (gpuProbe.ts), and
+      // this worker is told the answer. Only an adapter that has already
+      // survived a real session creation on this machine ever arrives here.
+      //
+      // WHY THOSE ATTEMPTS WERE DOOMED ANYWAY: ONNX Runtime requires memory
+      // pattern optimisation OFF and sequential execution for DirectML "or an
+      // error will be returned", and the shared session options enable memory
+      // patterns for CPU throughput. Every attempt was invalid before it began.
+      // getDirectMLSessionOptions() is the corrected set.
       //
       // HOW THIS REACHES ORT. Passing transformers.js a `device` string gives no
       // way to specify deviceId. But it assigns its own provider list with
@@ -299,109 +306,32 @@ parentPort.on('message', async (msg: any) => {
       // — `??=`, so a list we supply is preserved. We therefore build the EP
       // list ourselves and pass it through session_options, with 'cpu' appended
       // so ORT falls back per-operator for anything DirectML cannot run.
-      //
-      // CRASH SAFETY. A GPU init that aborts the process would otherwise make
-      // the app unopenable forever. Before attempting one we drop a sentinel
-      // file and clear it once the model is loaded; finding a stale sentinel at
-      // startup means the previous attempt never survived, so we stay on CPU and
-      // say so. Worst case is a single crash, then permanent automatic fallback.
-      // This mirrors the writeLoadSentinel/consumePoisonedOnnxLoad pattern used
-      // for model loads elsewhere in this codebase.
-      const GPU_DEVICES = new Set(['dml', 'cuda', 'webgpu']);
-      const requestedDevice = (process.env.NATIVELY_ONNX_DEVICE ?? '').trim().toLowerCase();
-      const deviceIdRaw = Number.parseInt(process.env.NATIVELY_ONNX_DEVICE_ID ?? '', 10);
-      const deviceId = Number.isInteger(deviceIdRaw) && deviceIdRaw >= 0 ? deviceIdRaw : undefined;
+      const probedDeviceId: number | null =
+        typeof msg.gpuDeviceId === 'number' ? msg.gpuDeviceId : null;
+      const gpuReason: string = msg.gpuReason ?? 'no GPU decision supplied';
 
-      const _gpuFs = require('fs');
-      const _gpuPath = require('path');
-      const gpuSentinelPath = _gpuPath.join(msg.cacheDir ?? '.', '.gpu-init-sentinel.json');
-      const readGpuSentinel = (): any | null => {
-        try {
-          if (!_gpuFs.existsSync(gpuSentinelPath)) return null;
-          return JSON.parse(_gpuFs.readFileSync(gpuSentinelPath, 'utf8'));
-        } catch { return null; }
-      };
-      const writeGpuSentinel = (info: unknown): void => {
-        try { _gpuFs.writeFileSync(gpuSentinelPath, JSON.stringify(info)); } catch { /* best-effort */ }
-      };
-      const clearGpuSentinel = (): void => {
-        try { if (_gpuFs.existsSync(gpuSentinelPath)) _gpuFs.unlinkSync(gpuSentinelPath); } catch { /* best-effort */ }
-      };
+      // NATIVELY_ONNX_DEVICE=cpu still forces CPU, for support cases.
+      const forcedCpu = (process.env.NATIVELY_ONNX_DEVICE ?? '').trim().toLowerCase() === 'cpu';
+      const useGpu = probedDeviceId !== null && !forcedCpu;
 
-      // AUTOMATIC GPU LADDER. Requiring a user to set environment variables to
-      // get their GPU used is not a fix, so this now configures itself.
-      //
-      // Adapter order cannot be queried from Node, but on a laptop the discrete
-      // GPU is conventionally adapter 1 and the integrated one adapter 0 — and
-      // the integrated GPU is what crashed when DirectML defaulted to adapter 0.
-      // So the ladder tries the discrete GPU first, then the integrated one,
-      // then CPU, recording each attempt so a failure is never repeated:
-      //
-      //   attempt 1 → dml deviceId=1   (discrete GPU, e.g. a laptop NVIDIA)
-      //   attempt 2 → dml deviceId=0   (integrated GPU)
-      //   attempt 3 → CPU              (always works, never retried past here)
-      //
-      // The sentinel is written BEFORE each attempt and cleared on success, so a
-      // native abort — which no JS catch can intercept — is still recorded. The
-      // next launch reads it and moves down the ladder. A machine that hates
-      // DirectML costs at most two startups before settling permanently on CPU.
-      //
-      // NATIVELY_ONNX_DEVICE=cpu opts out entirely; NATIVELY_ONNX_DEVICE=dml
-      // plus NATIVELY_ONNX_DEVICE_ID=N pins a specific adapter.
-      const isWindows = process.platform === 'win32';
-      let chosenDevice: string | undefined;
-      let chosenDeviceId: number | undefined;
+      console.log(
+        `[WhisperWorker] GPU decision: ${useGpu ? `DirectML adapter ${probedDeviceId}` : 'CPU'}` +
+        `${forcedCpu ? ' (forced by NATIVELY_ONNX_DEVICE=cpu)' : ''} — ${gpuReason}`,
+      );
 
-      if (requestedDevice === 'cpu') {
-        console.log('[WhisperWorker] GPU disabled by NATIVELY_ONNX_DEVICE=cpu');
-      } else if (GPU_DEVICES.has(requestedDevice)) {
-        chosenDevice = requestedDevice;
-        chosenDeviceId = deviceId;
-      } else if (isWindows && (process.env.NATIVELY_ONNX_GPU_LADDER ?? '') === '1') {
-        // OFF BY DEFAULT. The automatic ladder crashed the app on launch, and
-        // the sentinel could not save it: a native DirectML abort can kill the
-        // process before the sentinel write reaches disk, so the next start
-        // reads no record, tries the same adapter, and crashes again — an
-        // unopenable app rather than the one-crash-then-fallback this was
-        // supposed to guarantee.
-        //
-        // An app that will not open is worse than one that transcribes slowly,
-        // so GPU stays opt-in until the attempt itself can be made survivable
-        // (a probe in a throwaway child process, whose death is observable
-        // instead of fatal).
-        chosenDevice = 'dml';
-        chosenDeviceId = deviceId ?? 1;
-      }
-
-      if (chosenDevice) {
-        const poisoned = readGpuSentinel();
-        if (poisoned) {
-          const failedId = typeof poisoned.deviceId === 'number' ? poisoned.deviceId : undefined;
-          if (deviceId !== undefined) {
-            // An explicit pin already failed — respect it and stop.
-            console.warn(`[WhisperWorker] SKIPPING GPU: pinned device ${chosenDevice}:${deviceId} previously failed to initialise. Using CPU.`);
-            chosenDevice = undefined;
-          } else if (failedId === 1) {
-            console.warn('[WhisperWorker] GPU adapter 1 previously failed to initialise — trying adapter 0 (integrated).');
-            chosenDeviceId = 0;
-          } else {
-            console.warn(`[WhisperWorker] GPU previously failed to initialise (${JSON.stringify(poisoned)}) — using CPU. Delete ${gpuSentinelPath} to retry.`);
-            chosenDevice = undefined;
-          }
-        }
-      }
-
-      // Our own EP list wins over transformers.js's, per the ??= above.
-      const gpuExecutionProviders = chosenDevice
-        ? [chosenDeviceId !== undefined ? { name: chosenDevice, deviceId: chosenDeviceId } : { name: chosenDevice }, 'cpu']
+      // DirectML's own mandatory session options — NOT the CPU ones. Passing
+      // the CPU set here is precisely the bug that crashed the app twice.
+      const gpuSessionOptions = useGpu ? getDirectMLSessionOptions() : null;
+      const gpuExecutionProviders = useGpu
+        ? [{ name: 'dml', deviceId: probedDeviceId }, 'cpu']
         : undefined;
-      const preferredDevice = chosenDevice;
-      const deviceIdInUse = chosenDeviceId;
+      const preferredDevice = useGpu ? 'dml' : undefined;
+      const deviceIdInUse = useGpu ? probedDeviceId : undefined;
 
       const buildPipeline = (device?: string) => pipeline('automatic-speech-recognition', msg.modelId, {
         dtype,
-        session_options: device && gpuExecutionProviders
-          ? { ...sessionOptions, executionProviders: gpuExecutionProviders }
+        session_options: device && gpuExecutionProviders && gpuSessionOptions
+          ? { ...gpuSessionOptions, executionProviders: gpuExecutionProviders }
           : sessionOptions,
         ...(device ? { device } : {}),
         ...(useExternalDataFormat !== undefined
@@ -420,29 +350,26 @@ parentPort.on('message', async (msg: any) => {
 
       try {
         if (preferredDevice) {
-          writeGpuSentinel({ device: preferredDevice, deviceId: deviceIdInUse ?? 'default', modelId: msg.modelId, at: Date.now() });
           console.log(
             `[WhisperWorker] building pipeline with device=${preferredDevice} deviceId=${deviceIdInUse ?? '(ORT default)'}` +
-            ` providers=${JSON.stringify(gpuExecutionProviders)}`,
+            ` providers=${JSON.stringify(gpuExecutionProviders)}` +
+            ` sessionOptions=${JSON.stringify(gpuSessionOptions)}`,
           );
         } else {
           console.log('[WhisperWorker] building pipeline on CPU (library default device)');
         }
         pipe = await buildPipeline(preferredDevice);
-        // Survived initialisation — this configuration is safe to retry.
-        clearGpuSentinel();
       } catch (deviceErr: any) {
-        // A GPU provider can fail for reasons entirely outside our control —
-        // no compatible adapter, a driver that rejects the graph, a DirectML
-        // version mismatch. Falling back to CPU keeps transcription working
-        // (slowly) instead of leaving the channel with no worker at all, which
-        // is silent from the user's side.
-        if (!preferredDevice || preferredDevice === 'cpu') { clearGpuSentinel(); throw deviceErr; }
-        // A clean JS throw (as opposed to a native abort) is recoverable — but
-        // keep the sentinel so the next launch does not retry a device that
-        // already failed here.
+        // The probe proved the adapter can create a session, but the probe used
+        // one small model — a different checkpoint can still be rejected (an
+        // operator DirectML cannot run, or weights too large for the card's
+        // VRAM). That arrives as an ordinary JS throw, so CPU is still reachable
+        // and transcription continues slowly instead of the channel having no
+        // worker at all, which is silent from the user's side.
+        if (!preferredDevice) throw deviceErr;
         console.warn(
-          `[WhisperWorker] device=${preferredDevice} failed to initialise (${deviceErr?.message ?? deviceErr}) — falling back to CPU`,
+          `[WhisperWorker] device=${preferredDevice} failed to initialise for ${msg.modelId} ` +
+          `(${deviceErr?.message ?? deviceErr}) — falling back to CPU`,
         );
         pipe = await buildPipeline(undefined);
       }

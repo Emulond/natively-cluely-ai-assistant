@@ -114,6 +114,7 @@
       "**/*.dylib",
       "**/vectorSearchWorker.js",
       "**/whisperWorker.js",
+    "**/gpuProbeChild.js",
       "**/intentClassifierWorker.js",
       "**/localEmbeddingWorker.js",
       "**/localRerankerWorker.js",

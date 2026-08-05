@@ -31,9 +31,14 @@ const providerLabel = (provider?: string): string => {
         ibmwatson: 'IBM Watson',
         soniox: 'Soniox',
         natively: 'Natively Pro',
+        'local-whisper': 'Local Whisper',
     };
     return labels[provider.toLowerCase()] || provider;
 };
+
+/** Local Whisper never reconnects to anything — it is a model on this machine. */
+const isLocalProvider = (provider?: string): boolean =>
+    (provider ?? '').toLowerCase() === 'local-whisper';
 
 const ChannelCard: React.FC<ChannelCardProps> = ({
     name, status, provider, error, errorCategory,
@@ -59,9 +64,14 @@ const ChannelCard: React.FC<ChannelCardProps> = ({
         : status === 'reconnecting' || status === 'awaiting-audio' ? iconReconnecting
         : iconConnected;
 
+    // "Reconnecting..." is a lie for a local model — there is no connection to
+    // re-establish. What that state actually means for Local Whisper is that
+    // inference is failing or falling behind, which the Details block below
+    // spells out. Naming it honestly is the difference between a user thinking
+    // their network is flaky and knowing their model is too slow.
     const statusLabel = status === 'connected' ? 'Operational'
         : status === 'awaiting-audio' ? 'Listening for audio…'
-        : status === 'reconnecting' ? 'Reconnecting...'
+        : status === 'reconnecting' ? (isLocalProvider(provider) ? 'Degraded' : 'Reconnecting...')
         : 'Error';
     const label = providerLabel(provider);
 

@@ -159,6 +159,41 @@ export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
     };
 }
 
+/**
+ * Session options for a session that will run on the DirectML execution
+ * provider.
+ *
+ * DirectML is not a drop-in: ONNX Runtime documents two hard requirements, and
+ * violating either makes session creation fail —
+ *
+ *   "The DirectML execution provider does not support the use of memory
+ *    pattern optimizations or parallel execution in onnxruntime. When supplying
+ *    session options during InferenceSession creation, these options must be
+ *    disabled or an error will be returned."
+ *   — onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html
+ *
+ * That is why the two earlier attempts at a GPU path took the whole app down at
+ * startup rather than falling back: the shared session options carry
+ * enableMemPattern (on by default off macOS, for CPU throughput) straight into
+ * a DirectML session, ORT rejects the combination inside native code, and the
+ * failure arrives as a process abort that no JS try/catch can intercept.
+ *
+ * enableCpuMemArena goes off too. It is not prohibited, but a DirectML session
+ * allocates on the GPU; a CPU arena only adds host memory to a process already
+ * holding two Whisper models resident.
+ *
+ * The thread counts are left alone. They are ignored for GPU-assigned nodes and
+ * still apply to whatever falls back to the CPU provider.
+ */
+export function getDirectMLSessionOptions(): OnnxThreadBounds {
+    return {
+        ...getBoundedOnnxSessionOptions(),
+        executionMode: 'sequential',
+        enableMemPattern: false,
+        enableCpuMemArena: false,
+    };
+}
+
 // ── Cross-loader concurrency gate ──────────────────────────────────────────
 //
 // A small async semaphore + memory floor shared by every local ONNX

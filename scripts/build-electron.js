@@ -72,6 +72,13 @@ build({
     'pdfjs-dist',
     'pdf-parse',
     'mammoth',
+    // Native addon. Its binding.js requires a platform-specific
+    // `onnxruntime_binding.node`, which esbuild has no loader for — bundling
+    // any file that requires it fails the whole build. It was never bundled
+    // before only because nothing required it directly (transformers.js pulls
+    // it in at runtime); gpuProbeChild.ts does. Externalising loads it from
+    // node_modules at runtime, which is the only way a .node addon can load.
+    'onnxruntime-node',
   ],
   sourcemap: true,
   jsx: 'automatic',
