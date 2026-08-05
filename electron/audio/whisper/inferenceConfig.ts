@@ -120,12 +120,14 @@ export function buildWorkerInitMessage(modelId: string): WorkerInitMessage {
     // the thing that crashes a meeting — by the time it is read, the dangerous
     // part already happened somewhere expendable.
     let gpuDeviceId: number | null = null;
+    let gpuQuantizedOk = false;
     let gpuReason = 'GPU probe has not finished yet — starting on CPU';
     try {
         const { getResolvedGpuDevice } = require('./gpuProbe');
         const probe = getResolvedGpuDevice();
         if (probe) {
             gpuDeviceId = probe.deviceId;
+            gpuQuantizedOk = !!probe.quantizedOk;
             gpuReason = probe.reason;
         }
     } catch {
@@ -140,6 +142,7 @@ export function buildWorkerInitMessage(modelId: string): WorkerInitMessage {
         expectedBytes,
         useExternalDataFormat,
         gpuDeviceId,
+        gpuQuantizedOk,
         gpuReason,
     };
 }

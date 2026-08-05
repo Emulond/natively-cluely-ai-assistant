@@ -74,6 +74,11 @@ export interface WorkerInitMessage {
   // native abort, so the only safe place to find out is a process whose death
   // the app can survive.
   gpuDeviceId?: number | null;
+  // Whether that adapter also accepted an int8 graph. When false the worker
+  // must load fp32 weights: the fp32 encoder session builds fine and then the
+  // q8 decoder session takes the process down, which is what happened on a
+  // GTX 1650 the probe had just cleared.
+  gpuQuantizedOk?: boolean;
   // Human-readable explanation of that choice, logged verbatim by the worker so
   // "why is it on the CPU / the wrong GPU" is answerable from a log alone.
   gpuReason?: string;

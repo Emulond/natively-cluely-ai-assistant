@@ -45,6 +45,21 @@ import { resolveGpuProbeChildPath } from './workerPathResolver';
 export interface GpuProbeResult {
     /** DirectML adapter index proven to create a session, or null for CPU. */
     deviceId: number | null;
+    /**
+     * Whether this adapter also accepted an INT8 (q8) graph.
+     *
+     * Proving the fp32 encoder loads is not enough. Whisper ships quantised
+     * decoders, and DirectML's int8 operator coverage is narrower than its
+     * float coverage. A machine where the probe passed on the fp32 encoder
+     * still took the app down when transformers.js went on to build the q8
+     * decoder session — the crash landed one line after:
+     *
+     *   building pipeline with device=dml deviceId=1 ...
+     *
+     * with no exception and no exit code. So the probe now tests a quantised
+     * graph too, and when that fails the GPU is still used — at fp32.
+     */
+    quantizedOk: boolean;
     /** Why — carried into the log so the choice is never a mystery. */
     reason: string;
     /** Cache key components, so a driver or runtime change re-probes. */
@@ -70,7 +85,7 @@ const CACHE_FILENAME = 'gpu-probe.json';
  * against an unchanged GPU and driver — a corrected probe that never gets to
  * run is not a correction.
  */
-const PROBE_LOGIC_VERSION = 2;
+const PROBE_LOGIC_VERSION = 3;
 
 const VENDOR_NVIDIA = 0x10de;
 const VENDOR_AMD = 0x1002;
@@ -153,6 +168,36 @@ export function findSmallestCachedOnnx(modelsDir: string): string | null {
                 // companion fails for reasons that have nothing to do with the
                 // GPU, which would poison the verdict.
                 if (size < 1_000_000) continue;
+                if (fs.existsSync(`${full}_data`)) continue;
+                if (!best || size < best.size) best = { file: full, size };
+            } catch { /* unreadable — skip */ }
+        }
+    };
+    walk(modelsDir, 0);
+    return best ? (best as { file: string }).file : null;
+}
+
+/**
+ * A quantised (int8) graph to test the adapter against.
+ *
+ * The fp32 encoder passing proves the DirectML device initialises. It does not
+ * prove the adapter can build the q8 decoder session transformers.js creates
+ * next — and on at least one machine that second session is what killed the
+ * app. Whisper's quantised files carry the dtype in the filename.
+ */
+export function findQuantizedOnnx(modelsDir: string): string | null {
+    let best: { file: string; size: number } | null = null;
+    const walk = (dir: string, depth: number): void => {
+        if (depth > 6) return;
+        let entries: fs.Dirent[];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) { walk(full, depth + 1); continue; }
+            if (!/(quantized|_q8|_int8)\.onnx$/i.test(entry.name)) continue;
+            try {
+                const { size } = fs.statSync(full);
+                if (size < 100_000) continue;
                 if (fs.existsSync(`${full}_data`)) continue;
                 if (!best || size < best.size) best = { file: full, size };
             } catch { /* unreadable — skip */ }
@@ -282,7 +327,7 @@ export async function resolveGpuDevice(opts: {
     force?: boolean;
 }): Promise<GpuProbeResult> {
     const cpu = (reason: string): GpuProbeResult => ({
-        deviceId: null, reason, signature: '', probedAt: Date.now(), attempts: [],
+        deviceId: null, quantizedOk: false, reason, signature: '', probedAt: Date.now(), attempts: [],
     });
 
     if (process.platform !== 'win32') {
@@ -321,6 +366,7 @@ export async function resolveGpuDevice(opts: {
     if (!control.ok) {
         const result: GpuProbeResult = {
             deviceId: null,
+            quantizedOk: false,
             reason:
                 `probe model ${path.basename(onnxPath)} could not be opened on the CPU either ` +
                 `(${control.error ?? 'unknown'}) — this is not a GPU problem, so no adapter was blamed`,
@@ -343,9 +389,26 @@ export async function resolveGpuDevice(opts: {
         const outcome = await runProbeChild(onnxPath, deviceId);
         attempts.push({ deviceId, ok: outcome.ok, ms: outcome.ms, error: outcome.error });
         if (outcome.ok) {
+            // The adapter works for float graphs. Now find out whether it also
+            // accepts int8 — Whisper's decoders are quantised, and that session
+            // is what actually crashed the app after a passing fp32 probe.
+            let quantizedOk = false;
+            const q8Path = findQuantizedOnnx(opts.modelsDir);
+            if (q8Path) {
+                const q8 = await runProbeChild(q8Path, deviceId);
+                attempts.push({ deviceId, ok: q8.ok, ms: q8.ms, error: q8.error ? `int8: ${q8.error}` : 'int8 graph' });
+                quantizedOk = q8.ok;
+            }
             const result: GpuProbeResult = {
                 deviceId,
-                reason: `DirectML adapter ${deviceId} (${vendor}) created a session in ${outcome.ms ?? '?'}ms`,
+                quantizedOk,
+                reason:
+                    `DirectML adapter ${deviceId} (${vendor}) created a session in ${outcome.ms ?? '?'}ms` +
+                    (q8Path
+                        ? (quantizedOk
+                            ? '; int8 graphs accepted'
+                            : '; int8 graphs REFUSED, so the GPU runs at fp32')
+                        : '; no int8 graph available to test, assuming fp32'),
                 signature,
                 probedAt: Date.now(),
                 attempts,
@@ -357,6 +420,7 @@ export async function resolveGpuDevice(opts: {
 
     const result: GpuProbeResult = {
         deviceId: null,
+        quantizedOk: false,
         reason: `no DirectML adapter could create a session (${attempts.length} tried) — using CPU`,
         signature,
         probedAt: Date.now(),
@@ -400,6 +464,7 @@ export function ensureGpuProbe(opts: { userDataDir: string; modelsDir: string })
     })
         .catch((e) => ({
             deviceId: null,
+            quantizedOk: false,
             reason: `GPU probe failed outright (${String(e?.message ?? e).slice(0, 200)}) — using CPU`,
             signature: '',
             probedAt: Date.now(),

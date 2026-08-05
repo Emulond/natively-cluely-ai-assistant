@@ -322,14 +322,37 @@ parentPort.on('message', async (msg: any) => {
       // DirectML's own mandatory session options — NOT the CPU ones. Passing
       // the CPU set here is precisely the bug that crashed the app twice.
       const gpuSessionOptions = useGpu ? getDirectMLSessionOptions() : null;
+
+      // INT8 IS NOT A GIVEN ON DIRECTML.
+      //
+      // Whisper ships a quantised decoder and an fp32 encoder. A GTX 1650 that
+      // the probe had just cleared — CPU control fine, DirectML session on the
+      // fp32 encoder fine in 1033ms — still took the whole app down one line
+      // after "building pipeline with device=dml deviceId=1", when
+      // transformers.js went on to build the q8 decoder session. No exception,
+      // no exit code: the boot marker recorded main.ts starting and never
+      // reaching its exit handler.
+      //
+      // DirectML's int8 operator coverage is narrower than its float coverage,
+      // so the probe now tests a quantised graph separately. When the adapter
+      // refuses one, the GPU is still worth using — just at fp32 throughout,
+      // which is also where a Turing card is fastest anyway.
+      const gpuRejectsInt8 = useGpu && msg.gpuQuantizedOk !== true;
+      const effectiveDtype: string | Record<string, string> = gpuRejectsInt8 ? 'fp32' : dtype;
+      if (gpuRejectsInt8) {
+        console.log(
+          '[WhisperWorker] DirectML did not accept an int8 graph on this adapter — ' +
+          'loading fp32 weights instead of the mixed q8 default',
+        );
+      }
       const gpuExecutionProviders = useGpu
         ? [{ name: 'dml', deviceId: probedDeviceId }, 'cpu']
         : undefined;
-      const preferredDevice = useGpu ? 'dml' : undefined;
+      let preferredDevice: string | undefined = useGpu ? 'dml' : undefined;
       const deviceIdInUse = useGpu ? probedDeviceId : undefined;
 
       const buildPipeline = (device?: string) => pipeline('automatic-speech-recognition', msg.modelId, {
-        dtype,
+        dtype: device ? effectiveDtype : dtype,
         session_options: device && gpuExecutionProviders && gpuSessionOptions
           ? { ...gpuSessionOptions, executionProviders: gpuExecutionProviders }
           : sessionOptions,
@@ -348,8 +371,48 @@ parentPort.on('message', async (msg: any) => {
         },
       });
 
+      // CRASH SENTINEL around the GPU pipeline build.
+      //
+      // The probe makes the DECISION safe; it cannot make every consequence of
+      // that decision safe, because the probe opens one graph and the pipeline
+      // opens several. If a build still aborts natively here, nothing in this
+      // process survives to record it — so the record is written FIRST and
+      // cleared on success. A stale sentinel at the next launch means the last
+      // GPU attempt never returned, and that model goes to the CPU instead of
+      // crashing the app a second time.
+      //
+      // Unlike the startup-time sentinel this replaces, this write happens well
+      // after boot with the filesystem long since warm, so it is not racing the
+      // abort from a standing start.
+      const _fsSentinel = require('fs');
+      const _pathSentinel = require('path');
+      const gpuBuildSentinel = _pathSentinel.join(
+        String(msg.cacheDir ?? '.'), '.gpu-build-sentinel.json',
+      );
+      const readGpuBuildSentinel = (): any | null => {
+        try { return JSON.parse(_fsSentinel.readFileSync(gpuBuildSentinel, 'utf8')); } catch { return null; }
+      };
+      const clearGpuBuildSentinel = (): void => {
+        try { _fsSentinel.unlinkSync(gpuBuildSentinel); } catch { /* absent is fine */ }
+      };
+
+      const poisonedBuild = readGpuBuildSentinel();
+      if (preferredDevice && poisonedBuild?.modelId === msg.modelId) {
+        console.warn(
+          `[WhisperWorker] SKIPPING GPU for ${msg.modelId}: a previous GPU pipeline build ` +
+          `never completed (${JSON.stringify(poisonedBuild)}). Using CPU. ` +
+          `Delete ${gpuBuildSentinel} to try again.`,
+        );
+        preferredDevice = undefined;
+      }
+
       try {
         if (preferredDevice) {
+          try {
+            _fsSentinel.writeFileSync(gpuBuildSentinel, JSON.stringify({
+              modelId: msg.modelId, deviceId: deviceIdInUse, dtype: effectiveDtype, at: Date.now(),
+            }));
+          } catch { /* best-effort */ }
           console.log(
             `[WhisperWorker] building pipeline with device=${preferredDevice} deviceId=${deviceIdInUse ?? '(ORT default)'}` +
             ` providers=${JSON.stringify(gpuExecutionProviders)}` +
@@ -359,7 +422,10 @@ parentPort.on('message', async (msg: any) => {
           console.log('[WhisperWorker] building pipeline on CPU (library default device)');
         }
         pipe = await buildPipeline(preferredDevice);
+        // Survived the build — this configuration is safe to use again.
+        clearGpuBuildSentinel();
       } catch (deviceErr: any) {
+        clearGpuBuildSentinel();
         // The probe proved the adapter can create a session, but the probe used
         // one small model — a different checkpoint can still be rejected (an
         // operator DirectML cannot run, or weights too large for the card's

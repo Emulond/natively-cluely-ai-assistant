@@ -197,3 +197,88 @@ describe('external-data stubs are not probed', () => {
     assert.equal(findSmallestCachedOnnx(dir), real);
   });
 });
+
+describe('int8 is proven separately from float', () => {
+  const probeSrc = read('electron/audio/whisper/gpuProbe.ts');
+  const workerSrc = read('electron/audio/whisper/whisperWorker.ts');
+
+  test('the probe tests a quantised graph after the fp32 one', () => {
+    // THE CRASH: the probe cleared a GTX 1650 on the fp32 encoder in 1033ms,
+    // then the app died one line after "building pipeline with device=dml
+    // deviceId=1" — when transformers.js built the q8 DECODER session. No
+    // exception, no exit code. DirectML's int8 operator coverage is narrower
+    // than its float coverage, and the probe was only testing float.
+    assert.match(probeSrc, /export function findQuantizedOnnx/);
+    assert.match(probeSrc, /const q8 = await runProbeChild\(q8Path, deviceId\)/);
+    assert.match(probeSrc, /quantizedOk = q8\.ok/);
+  });
+
+  test('a refusal downgrades the dtype, it does not abandon the GPU', () => {
+    // fp32 on a Turing card still beats the CPU comfortably.
+    assert.match(workerSrc, /const gpuRejectsInt8 = useGpu && msg\.gpuQuantizedOk !== true/);
+    assert.match(
+      workerSrc,
+      /const effectiveDtype: string \| Record<string, string> = gpuRejectsInt8 \? 'fp32' : dtype/,
+    );
+    assert.match(workerSrc, /dtype: device \? effectiveDtype : dtype/);
+  });
+
+  test('the CPU path keeps its mixed q8 dtype', () => {
+    // q8 decoders are the main CPU speed win and are not implicated here.
+    assert.match(
+      workerSrc,
+      /dtype: device \? effectiveDtype : dtype/,
+      'a CPU build must pass the original dtype, not the GPU downgrade',
+    );
+  });
+
+  test('the probe verdict carries quantizedOk end to end', () => {
+    assert.match(probeSrc, /quantizedOk: boolean/);
+    assert.match(read('electron/audio/whisper/types.ts'), /gpuQuantizedOk\?: boolean/);
+    assert.match(
+      read('electron/audio/whisper/inferenceConfig.ts'),
+      /gpuQuantizedOk = !!probe\.quantizedOk/,
+    );
+  });
+
+  test('probe logic version was bumped so the old verdict cannot be reused', () => {
+    const version = Number(probeSrc.match(/const PROBE_LOGIC_VERSION = (\d+)/)?.[1]);
+    assert.ok(version >= 3, `expected >= 3, got ${version}`);
+  });
+});
+
+describe('a GPU pipeline build that never returns is not repeated', () => {
+  const workerSrc = read('electron/audio/whisper/whisperWorker.ts');
+
+  test('a sentinel is written before the build and cleared after', () => {
+    // The probe makes the DECISION safe; it cannot make every consequence safe,
+    // because it opens one graph and the pipeline opens several. If a build
+    // still aborts, nothing in-process survives to report it — so the record
+    // goes down first.
+    assert.match(workerSrc, /\.gpu-build-sentinel\.json/);
+    // Ordering is the whole point: written BEFORE, cleared AFTER. The window
+    // between them holds the "building pipeline with device=..." log line.
+    const writeIdx = workerSrc.indexOf('_fsSentinel.writeFileSync(gpuBuildSentinel');
+    const buildIdx = workerSrc.indexOf('pipe = await buildPipeline(preferredDevice);');
+    const clearIdx = workerSrc.indexOf('clearGpuBuildSentinel();', buildIdx);
+    assert.ok(writeIdx > 0, 'the sentinel must be written');
+    assert.ok(buildIdx > writeIdx, 'the write must precede the GPU build');
+    assert.ok(clearIdx > buildIdx, 'the clear must follow a successful build');
+  });
+
+  test('a stale sentinel for the same model forces CPU', () => {
+    assert.match(
+      workerSrc,
+      /if \(preferredDevice && poisonedBuild\?\.modelId === msg\.modelId\) \{[\s\S]{0,600}?preferredDevice = undefined;/,
+      'the second attempt at a build that already killed the app must go to CPU',
+    );
+  });
+
+  test('a caught build error clears it too — that path is recoverable', () => {
+    assert.match(
+      workerSrc,
+      /\} catch \(deviceErr: any\) \{\s*\n\s*clearGpuBuildSentinel\(\);/,
+      'a JS throw fell back to CPU in-process; it must not poison the next launch',
+    );
+  });
+});
