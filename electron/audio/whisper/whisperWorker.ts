@@ -241,6 +241,61 @@ parentPort.on('message', async (msg: any) => {
           ortBackend: (env.backends?.onnx ? Object.keys(env.backends.onnx) : []),
           execEnv: { execPath: process.execPath, nodeVer: process.version, modules: process.versions.modules, electron: process.versions.electron || 'n/a' },
         }));
+
+        // FULL ON-DISK INVENTORY.
+        //
+        // The two lines above report only the files ONE dtype expects, which is
+        // how an entire debugging round got spent arguing about whether a model
+        // was downloaded. It was — just not in the precision that had been asked
+        // for. Whisper ships each module at several precisions, distinguished by
+        // a filename suffix ('' = fp32, '_quantized' = q8, '_fp16' = fp16), and a
+        // normal download fetches an fp32 encoder with q8 decoders. Nothing
+        // printed the actual directory, so "downloaded" and "downloaded in the
+        // precision we are about to request" looked identical in the log.
+        //
+        // Listing the directory answers that in one line, offline, without
+        // anyone needing to reach the model host to find out what it publishes.
+        const DTYPE_SUFFIX: Record<string, string> = {
+          fp32: '', fp16: '_fp16', int8: '_int8', uint8: '_uint8',
+          q8: '_quantized', q4: '_q4', q4f16: '_q4f16', bnb4: '_bnb4',
+        };
+        const _mb = (bytes: number) => (bytes < 0 ? null : Math.round(bytes / 1048576 * 10) / 10);
+        let _onDisk: Array<{ file: string; mb: number | null }> = [];
+        try {
+          _onDisk = (_fs.readdirSync(_modelDir) as string[])
+            .filter((f) => f.endsWith('.onnx') || f.endsWith('.onnx_data'))
+            .sort()
+            .map((f) => ({ file: f, mb: _mb(_stat(_path.join(_modelDir, f))) }));
+        } catch { /* directory unreadable — the `present` list stays empty */ }
+
+        // What the dtype actually in force will ask the loader to open.
+        const _dtypeFor = (module: string): string =>
+          typeof dtype === 'string' ? dtype : ((dtype as Record<string, string>)[module] ?? 'fp32');
+        const _wanted = ['encoder_model', 'decoder_model_merged', 'decoder_model', 'decoder_with_past_model']
+          .map((module) => {
+            const dt = _dtypeFor(module);
+            const file = `${module}${DTYPE_SUFFIX[dt] ?? ''}.onnx`;
+            const bytes = _stat(_path.join(_modelDir, file));
+            return { module, dtype: dt, file, present: bytes > 0, mb: _mb(bytes) };
+          });
+        const _missing = _wanted.filter((w) => !w.present).map((w) => w.file);
+
+        console.log('[WhisperWorker][diag:files] ' + JSON.stringify({
+          modelDir: _modelDir,
+          present: _onDisk,
+          requiredForThisDtype: _wanted,
+          // Whisper models ship EITHER a merged decoder OR the split pair, so a
+          // missing entry is only a real problem when neither layout is complete.
+          note: 'a model provides either decoder_model_merged OR decoder_model + decoder_with_past_model',
+          missing: _missing,
+        }));
+        if (_missing.length > 0) {
+          console.warn(
+            `[WhisperWorker] ${msg.modelId}: these files are NOT on disk for the requested ` +
+            `precision — ${_missing.join(', ')}. If the loader needs one of them it will try ` +
+            'to DOWNLOAD it now, which can stall model load for minutes with no other symptom.',
+          );
+        }
       } catch (diagErr: any) {
         console.log('[WhisperWorker][diag] diagnostics failed (non-fatal):', diagErr?.message);
       }
