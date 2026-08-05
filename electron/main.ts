@@ -5165,14 +5165,26 @@ export class AppState {
    * restart, and the settle is what matters, not the outcome.
    */
   public async stopAudioTestAndAwaitTeardown(): Promise<void> {
-    const mic = this.audioTestCapture;
-    const system = this.audioTestSystemCapture;
     this.stopAudioTest();
-    await Promise.allSettled([
-      mic ? Promise.resolve(mic.stop()) : Promise.resolve(),
-      system ? Promise.resolve(system.stop()) : Promise.resolve(),
-    ]);
+    await this._audioTestTeardown;
   }
+
+  /**
+   * The most recent audio-test native teardown, whoever started it.
+   *
+   * THIS IS WHY THE FIRST ATTEMPT AT THIS FIX DID NOT WORK. It read
+   * this.audioTestCapture and awaited that wrapper's stop(). But the renderer
+   * sends stop-audio-test BEFORE start-audio-test, and stopAudioTest() nulls
+   * the field — so by the time the start path looked, there was nothing left to
+   * await and it sailed straight through into reopening the device. The crash
+   * came back unchanged:
+   *
+   *   16:33:55.073 Stopping capture (deferred native teardown)...
+   *   16:33:57.280 Starting native capture...            <dead>
+   *
+   * The promise has to outlive the wrapper reference, so it lives here.
+   */
+  private _audioTestTeardown: Promise<unknown> = Promise.resolve();
 
   public stopAudioTest(): void {
     // UX4 hardening: bump epoch so any in-flight _startAudioTestImpl that's
@@ -5192,19 +5204,28 @@ export class AppState {
     // keep the DSP thread alive after the settings panel is closed. Mirrors
     // the endMeeting() pattern where disablePreWarm() is called before stop().
     this.audioTestCapture?.disablePreWarm();
+    // Capture the teardown promises HERE, where the wrappers still exist, and
+    // hold them on the instance. A later start() awaits this rather than trying
+    // to re-derive it from fields this method is about to null.
+    const pending: Array<Promise<unknown>> = [];
     if (this.audioTestCapture) {
       console.log('[Main] Stopping Audio Test');
-      this.audioTestCapture.stop();
+      try { pending.push(Promise.resolve(this.audioTestCapture.stop())); } catch (e) {
+        console.warn('[Main] Stopping mic audio test threw:', e);
+      }
       this.audioTestCapture = null;
     }
     // UX4: also stop the parallel system probe.
     if (this.audioTestSystemCapture) {
       try {
-        this.audioTestSystemCapture.stop();
+        pending.push(Promise.resolve(this.audioTestSystemCapture.stop()));
       } catch (e) {
         console.warn('[Main] Stopping system audio test threw:', e);
       }
       this.audioTestSystemCapture = null;
+    }
+    if (pending.length > 0) {
+      this._audioTestTeardown = Promise.allSettled(pending);
     }
   }
 

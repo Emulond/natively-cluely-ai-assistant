@@ -216,11 +216,28 @@ describe('int8 is proven separately from float', () => {
   test('a refusal downgrades the dtype, it does not abandon the GPU', () => {
     // fp32 on a Turing card still beats the CPU comfortably.
     assert.match(workerSrc, /const gpuRejectsInt8 = useGpu && msg\.gpuQuantizedOk !== true/);
+    assert.match(workerSrc, /effectiveDtype = 'fp32'/);
+    assert.match(workerSrc, /dtype: device \? effectiveDtype : dtype/);
+  });
+
+  test('fp32 is only chosen when those weights are already on disk', () => {
+    // Models download at the mixed default — fp32 encoder, QUANTISED decoders.
+    // Asking for uniform fp32 asks for a decoder that was never fetched, and
+    // transformers.js answers by downloading several hundred MB, silently, at
+    // meeting start. The worker never reaches "model READY" and the channel
+    // shows "STT reconnecting" forever. The diagnostics said so all along:
+    //   decoderFile: decoder_model_merged.onnx  decoderBytes: -1
+    assert.match(workerSrc, /const fp32DecoderPresent = \(\): boolean =>/);
     assert.match(
       workerSrc,
-      /const effectiveDtype: string \| Record<string, string> = gpuRejectsInt8 \? 'fp32' : dtype/,
+      /if \(fp32DecoderPresent\(\)\) \{[\s\S]{0,400}?effectiveDtype = 'fp32'/,
+      'the fp32 switch must be gated on the files existing',
     );
-    assert.match(workerSrc, /dtype: device \? effectiveDtype : dtype/);
+    assert.match(
+      workerSrc,
+      /\} else \{[\s\S]{0,600}?preferredDevice = undefined;/,
+      'with no cached fp32 decoder the GPU must be dropped, not the download started',
+    );
   });
 
   test('the CPU path keeps its mixed q8 dtype', () => {

@@ -47,22 +47,47 @@ describe('audio test restart waits for the native teardown', () => {
     );
   });
 
-  test('it awaits both capture wrappers, not just the microphone', () => {
-    // The system probe opens its own native stream and has the same hazard.
+  test('the teardown promise outlives the wrapper reference', () => {
+    // THE FIRST ATTEMPT AT THIS FIX DID NOT WORK, for this exact reason: it
+    // read this.audioTestCapture and awaited that wrapper's stop(). But the
+    // renderer sends stop-audio-test BEFORE start-audio-test, and stopAudioTest
+    // nulls the field — so the start path found nothing to await and sailed
+    // through into reopening the device. The crash came back unchanged.
+    assert.match(
+      mainSrc,
+      /private _audioTestTeardown: Promise<unknown> = Promise\.resolve\(\)/,
+      'the pending teardown must be held on the instance, not re-derived',
+    );
     const body = mainSrc.slice(
       mainSrc.indexOf('public async stopAudioTestAndAwaitTeardown'),
-      mainSrc.indexOf('public stopAudioTest(): void'),
+      mainSrc.indexOf('private _audioTestTeardown'),
     );
-    assert.match(body, /mic \? Promise\.resolve\(mic\.stop\(\)\)/);
-    assert.match(body, /system \? Promise\.resolve\(system\.stop\(\)\)/);
+    assert.match(body, /await this\._audioTestTeardown/);
+    // Strip comments first: the surrounding documentation names the field on
+    // purpose, to record why the earlier version of this fix did nothing.
+    const code = body
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n');
+    assert.ok(
+      !/this\.audioTestCapture/.test(code),
+      'awaiting a field stopAudioTest() has already nulled is the bug this pins',
+    );
   });
 
-  test('teardown failure cannot block the restart', () => {
+  test('stopAudioTest records both wrappers teardown before nulling them', () => {
+    // The system probe opens its own native stream and has the same hazard.
     const body = mainSrc.slice(
-      mainSrc.indexOf('public async stopAudioTestAndAwaitTeardown'),
       mainSrc.indexOf('public stopAudioTest(): void'),
+      mainSrc.indexOf('public finalizeMicSTT'),
     );
-    assert.match(body, /Promise\.allSettled/, 'a rejecting stop must not abort the restart');
+    assert.match(body, /pending\.push\(Promise\.resolve\(this\.audioTestCapture\.stop\(\)\)\)/);
+    assert.match(body, /pending\.push\(Promise\.resolve\(this\.audioTestSystemCapture\.stop\(\)\)\)/);
+    assert.match(
+      body,
+      /this\._audioTestTeardown = Promise\.allSettled\(pending\)/,
+      'a rejecting stop must not abort the restart',
+    );
   });
 
   test('starting the test awaits the previous teardown', () => {

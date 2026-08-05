@@ -322,6 +322,7 @@ parentPort.on('message', async (msg: any) => {
       // DirectML's own mandatory session options — NOT the CPU ones. Passing
       // the CPU set here is precisely the bug that crashed the app twice.
       const gpuSessionOptions = useGpu ? getDirectMLSessionOptions() : null;
+      let preferredDevice: string | undefined = useGpu ? 'dml' : undefined;
 
       // INT8 IS NOT A GIVEN ON DIRECTML.
       //
@@ -338,17 +339,55 @@ parentPort.on('message', async (msg: any) => {
       // refuses one, the GPU is still worth using — just at fp32 throughout,
       // which is also where a Turing card is fastest anyway.
       const gpuRejectsInt8 = useGpu && msg.gpuQuantizedOk !== true;
-      const effectiveDtype: string | Record<string, string> = gpuRejectsInt8 ? 'fp32' : dtype;
+
+      // ...BUT ONLY IF THE fp32 WEIGHTS ARE ALREADY ON DISK.
+      //
+      // Models download at the mixed default: an fp32 encoder and QUANTISED
+      // decoders. Asking for uniform fp32 asks for a decoder file that was
+      // never fetched, and transformers.js responds by downloading it — several
+      // hundred megabytes, silently, at meeting start. The worker never reaches
+      // "model READY", the channel shows "STT reconnecting" forever, and
+      // nothing in the log says a download is underway. That is what happened
+      // with whisper-small: the diagnostics recorded it plainly and I did not
+      // read them —
+      //
+      //   encoderFile: encoder_model.onnx        encoderBytes: 352839389
+      //   decoderFile: decoder_model_merged.onnx decoderBytes: -1
+      //
+      // -1 is "not present". So check before switching, and stay on the CPU
+      // when the files are missing: slow transcription beats none.
+      const fp32DecoderPresent = (): boolean => {
+        try {
+          const _fs = require('fs');
+          const _path = require('path');
+          const parts = String(msg.modelId).split('/');
+          const dir = _path.join(String(msg.cacheDir), parts[0] ?? '', parts[1] ?? '', 'onnx');
+          return ['decoder_model_merged.onnx', 'decoder_model.onnx'].some((f) => {
+            try { return _fs.statSync(_path.join(dir, f)).size > 0; } catch { return false; }
+          });
+        } catch { return false; }
+      };
+
+      let effectiveDtype: string | Record<string, string> = dtype;
       if (gpuRejectsInt8) {
-        console.log(
-          '[WhisperWorker] DirectML did not accept an int8 graph on this adapter — ' +
-          'loading fp32 weights instead of the mixed q8 default',
-        );
+        if (fp32DecoderPresent()) {
+          effectiveDtype = 'fp32';
+          console.log(
+            '[WhisperWorker] DirectML did not accept an int8 graph on this adapter — ' +
+            'loading the fp32 weights already on disk instead of the mixed q8 default',
+          );
+        } else {
+          console.warn(
+            `[WhisperWorker] DirectML refuses int8 on this adapter and ${msg.modelId} has no ` +
+            'fp32 decoder cached — using the CPU rather than triggering a multi-hundred-MB ' +
+            'download in the middle of a meeting.',
+          );
+          preferredDevice = undefined;
+        }
       }
       const gpuExecutionProviders = useGpu
         ? [{ name: 'dml', deviceId: probedDeviceId }, 'cpu']
         : undefined;
-      let preferredDevice: string | undefined = useGpu ? 'dml' : undefined;
       const deviceIdInUse = useGpu ? probedDeviceId : undefined;
 
       const buildPipeline = (device?: string) => pipeline('automatic-speech-recognition', msg.modelId, {
