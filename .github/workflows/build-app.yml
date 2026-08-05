@@ -40,6 +40,35 @@ jobs:
           Write-Host "Runner has $n logical processors"
           "count=$n" >> $env:GITHUB_OUTPUT
 
+      # WHY THIS JOB RUNS ON WINDOWS AT ALL, since the question comes up:
+      # native-module/Cargo.toml has a Windows-only dependency block (wasapi +
+      # the windows crate with Win32_Media_Audio / Win32_System_Com) for
+      # system-audio capture, and postinstall rebuilds native Node addons
+      # against Electron's ABI for the machine it runs on. Both need a Windows
+      # toolchain. Linux runners are faster in general, but they cannot compile
+      # this code — so the job is stuck here, and the way to make it quicker is
+      # to make Windows itself less slow.
+      #
+      # Defender's real-time scanner inspects every one of the ~100k small files
+      # npm writes and every artifact the Rust and packaging steps produce, and
+      # it is the single biggest avoidable cost on a Windows runner. The runner
+      # is a throwaway VM building our own source, so scanning it buys nothing.
+      #
+      # continue-on-error: a runner image where this is unavailable should build
+      # slowly, not fail.
+      - name: Exempt the build from Defender's real-time scanner
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+          Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP"
+          Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\npm-cache"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          foreach ($p in 'node.exe','npm.exe','rustc.exe','cargo.exe','link.exe','cl.exe','7z.exe') {
+            Add-MpPreference -ExclusionProcess $p
+          }
+          Write-Host "Defender exclusions applied"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
