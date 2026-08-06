@@ -17,24 +17,24 @@
 import { parentPort } from 'worker_threads';
 import { WhisperProgressAggregator } from './whisperProgressAggregator';
 import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
+import { RECOGNITION_LANGUAGES } from '../../config/languages';
 
-const LANG_MAP: Record<string, string | null> = {
-  'auto': null,
-  'en-US': 'english',
-  'en-GB': 'english',
-  'fr-FR': 'french',
-  'de-DE': 'german',
-  'es-ES': 'spanish',
-  'ja-JP': 'japanese',
-  'ko-KR': 'korean',
-  'zh-CN': 'chinese',
-  'zh-TW': 'chinese',
-  'pt-BR': 'portuguese',
-  'it-IT': 'italian',
-  'ru-RU': 'russian',
-  'ar': 'arabic',
-  'hi-IN': 'hindi',
-};
+// The host sends the shared RECOGNITION_LANGUAGES key ('russian', 'english-us',
+// 'auto') — the same value every other STT provider receives — NOT a BCP-47 tag.
+// A BCP-47-keyed table ('ru-RU', 'en-US') misses every real selection, so the
+// explicit language silently fell through to null and Whisper forced English.
+// Resolve through the shared config and read iso639 (Whisper's language tokens
+// are ISO-639-1), matching OpenAI/Groq/Deepgram/ElevenLabs/Soniox. 'auto' and
+// unknown keys resolve to null, leaving the language unforced.
+//
+// NOTE: transformers.js 3.8.1 does not implement Whisper language detection —
+// when language is unset on a multilingual checkpoint it hardcodes English
+// (models.js _retrieve_init_tokens). So 'auto' on local Whisper still decodes
+// as English; only an explicit selection is honored.
+function resolveWhisperLanguage(key: string): string | null {
+  if (!key || key === 'auto') return null;
+  return RECOGNITION_LANGUAGES[key]?.iso639 ?? null;
+}
 
 let pipe: any = null;
 let loadedModelId = '';
@@ -265,7 +265,7 @@ parentPort.on('message', async (msg: any) => {
       return;
     }
     try {
-      let language: string | null = LANG_MAP[msg.language] ?? null;
+      let language: string | null = resolveWhisperLanguage(msg.language);
       const streaming: boolean = !!msg.streaming;
 
       // English-only checkpoints (Distil-Whisper + .en variants) have no
