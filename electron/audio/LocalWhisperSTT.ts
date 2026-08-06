@@ -1096,7 +1096,10 @@ export class LocalWhisperSTT extends EventEmitter {
         if (!hasEnoughMemoryForOnnxSession()) {
             const heapGB = (process.memoryUsage().heapUsed / 1024 ** 3).toFixed(1);
             throw new Error(
-                `[LocalWhisperSTT] insufficient available memory (<${getMinFreeGBForOnnxSession()}GB) — Whisper init refused (heaped=${heapGB}GB)`,
+                `[LocalWhisperSTT] insufficient available memory (<${getMinFreeGBForOnnxSession()}GB free) — ` +
+                `Whisper init refused for ${this.modelId} (available=${getAvailableMemoryGB().toFixed(1)}GB, ` +
+                `this process heap=${heapGB}GB). A model download in progress is the usual cause: it holds the ` +
+                `whole model in memory while fetching, so nothing transcribes until it finishes or is paused.`,
             );
         }
 

@@ -395,6 +395,18 @@ export class LocalModelDownloadService {
   }
 
   private onWorkerMessage(key: string, msg: any): void {
+    // Worker console output. The whisper worker forwards its own logs as
+    // { type: 'log' } messages, and this handler dropped them — so everything a
+    // DOWNLOAD worker reported was invisible, including which extra precisions
+    // it fetched. "I don't see a single mention of fp16" was exactly right: the
+    // worker may well have said it, and this method threw the message away.
+    if (msg?.type === 'log') {
+      const line = `[DownloadWorker ${key}] ${msg.message ?? ''}`;
+      if (msg.level === 'error') console.error(line);
+      else if (msg.level === 'warn') console.warn(line);
+      else console.log(line);
+      return;
+    }
     const cur = this.entries.get(key);
     if (!cur) return; // entry vanished (e.g. cancel race) — drop
     const provider = this.opts.providers.get(cur.provider);
@@ -460,6 +472,40 @@ export class LocalModelDownloadService {
       error: err?.message ? String(err.message) : 'Worker crashed',
       updatedAt: Date.now(),
     });
+  }
+
+  /**
+   * Stop every in-flight download so a meeting can have the memory.
+   *
+   * A download worker does not merely fetch bytes — transformers.js `pipeline()`
+   * DOWNLOADS AND LOADS, so the model ends up resident in that worker. For
+   * Whisper Large v3 Turbo that is multiple gigabytes, and it starved the thing
+   * the user actually asked for:
+   *
+   *   rss=6398.8MB free=1687.6MB total=16109.3MB
+   *   [LocalWhisperSTT] spawnWorker failed: insufficient available memory
+   *     (<2GB) — Whisper init refused
+   *
+   * A meeting the user just started outranks a background download every time.
+   * Entries are marked 'interrupted', which the panel already renders as
+   * "Download was interrupted. Click Install to retry." — so nothing is lost
+   * silently and the download is resumable.
+   */
+  pauseAllForMeeting(reason = 'a meeting started'): number {
+    let stopped = 0;
+    for (const [key, entry] of this.entries) {
+      if (entry.status !== 'downloading' && entry.status !== 'verifying') continue;
+      console.warn(
+        `[LocalModelDownloadService] ${key}: pausing — ${reason}. ` +
+        'A download holds the whole model in memory, which can starve live transcription. ' +
+        'Click Install to resume it afterwards.',
+      );
+      this.terminateWorker(key, true);
+      this.setEntry(key, { ...entry, status: 'interrupted', updatedAt: Date.now() });
+      stopped++;
+    }
+    if (stopped > 0) this.schedulePersistence();
+    return stopped;
   }
 
   private terminateWorker(key: string, suppressPersistence = false): void {

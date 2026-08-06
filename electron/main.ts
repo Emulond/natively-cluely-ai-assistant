@@ -5294,6 +5294,31 @@ export class AppState {
   public async startMeeting(metadata?: any): Promise<void> {
     console.log('[Main] Starting Meeting...', metadata);
 
+    // A meeting outranks any background model download.
+    //
+    // A download worker does not merely fetch bytes — transformers.js
+    // `pipeline()` downloads AND loads, so the model sits resident in that
+    // worker for the whole download. With Whisper Large v3 Turbo in flight that
+    // is multiple gigabytes, and it took the meeting's own transcription down
+    // with it:
+    //
+    //   rss=6398.8MB free=1687.6MB total=16109.3MB
+    //   [LocalWhisperSTT] spawnWorker failed: insufficient available memory
+    //     (<2GB) — Whisper init refused
+    //
+    // Nothing was transcribed for that entire session. Pausing is resumable and
+    // the panel already says so ("Download was interrupted. Click Install to
+    // retry."); a meeting that cannot hear anything is not.
+    try {
+      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
+      const paused = LocalModelDownloadService.getInstance().pauseAllForMeeting('a meeting is starting');
+      if (paused > 0) {
+        console.log(`[Main] Paused ${paused} model download(s) so the meeting has memory to load its model.`);
+      }
+    } catch (e: any) {
+      console.warn('[Main] Could not pause model downloads for the meeting:', e?.message ?? e);
+    }
+
     // If a previous endMeeting() is still draining STT in the background, wait
     // for it to finish before we boot a new session — otherwise the BG teardown
     // could call STT.stop() on instances the new meeting just started using.

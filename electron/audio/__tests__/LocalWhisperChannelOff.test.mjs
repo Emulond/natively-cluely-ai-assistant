@@ -349,3 +349,78 @@ describe('the GPU precision is part of a complete download', () => {
     );
   });
 });
+
+describe('a meeting outranks a background download', () => {
+  const svcSrc = read('electron/services/LocalModelDownloadService.ts');
+  const sttSrc = read('electron/audio/LocalWhisperSTT.ts');
+
+  test('starting a meeting pauses in-flight downloads', () => {
+    // A download worker does not merely fetch bytes — transformers.js
+    // pipeline() downloads AND loads, so the model sits resident in that worker
+    // for the whole download. With Whisper Large v3 Turbo in flight:
+    //
+    //   rss=6398.8MB free=1687.6MB total=16109.3MB
+    //   [LocalWhisperSTT] spawnWorker failed: insufficient available memory
+    //     (<2GB) — Whisper init refused
+    //
+    // Nothing transcribed for that entire session.
+    assert.match(svcSrc, /pauseAllForMeeting\(reason = 'a meeting started'\): number/);
+    const startIdx = mainSrc.indexOf('public async startMeeting');
+    const pauseIdx = mainSrc.indexOf('pauseAllForMeeting', startIdx);
+    const pipelineIdx = mainSrc.indexOf('reconfigureAudio', startIdx);
+    assert.ok(pauseIdx > startIdx, 'startMeeting must pause downloads');
+    assert.ok(
+      pipelineIdx === -1 || pauseIdx < pipelineIdx,
+      'and it must do so BEFORE the audio pipeline tries to load a model',
+    );
+  });
+
+  test('pausing is resumable, not a cancellation', () => {
+    // 'interrupted' is what the panel renders as "Download was interrupted.
+    // Click Install to retry." — so nothing is lost silently.
+    const body = svcSrc.slice(
+      svcSrc.indexOf('pauseAllForMeeting('),
+      svcSrc.indexOf('private terminateWorker('),
+    );
+    assert.match(body, /status: 'interrupted'/);
+    assert.match(body, /this\.terminateWorker\(key, true\)/);
+    assert.ok(
+      !/deletePartial/.test(body),
+      'pausing must not delete the bytes already fetched',
+    );
+  });
+
+  test('only live downloads are touched', () => {
+    const body = svcSrc.slice(
+      svcSrc.indexOf('pauseAllForMeeting('),
+      svcSrc.indexOf('private terminateWorker('),
+    );
+    assert.match(
+      body,
+      /if \(entry\.status !== 'downloading' && entry\.status !== 'verifying'\) continue/,
+    );
+  });
+
+  test('a failure to pause cannot block the meeting', () => {
+    assert.match(
+      mainSrc,
+      /pauseAllForMeeting\('a meeting is starting'\)[\s\S]{0,400}?\} catch \(e: any\) \{/,
+    );
+  });
+
+  test('the memory refusal names the likely cause', () => {
+    // "insufficient available memory (<2GB)" alone left the user to guess.
+    assert.match(sttSrc, /A model download in progress is the usual cause/);
+    assert.match(sttSrc, /available=\$\{getAvailableMemoryGB\(\)\.toFixed\(1\)\}GB/);
+  });
+
+  test('download workers get their console forwarded', () => {
+    // The whisper worker forwards its logs as { type: 'log' } messages and this
+    // handler dropped them, so everything a DOWNLOAD worker reported was
+    // invisible — including which extra precisions it fetched.
+    assert.match(
+      svcSrc,
+      /if \(msg\?\.type === 'log'\) \{[\s\S]{0,400}?\[DownloadWorker \$\{key\}\]/,
+    );
+  });
+});
