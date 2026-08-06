@@ -2814,18 +2814,28 @@ export class AppState {
       }
     } else if (sttProvider === 'local-whisper') {
       const { LocalWhisperSTT } = require('./audio/LocalWhisperSTT');
+      const { MODEL_CATALOG_IDS } = require('./audio/whisper/modelManager');
       const sm = SettingsManager.getInstance();
-      const globalModel = sm.get('localWhisperModel') ?? 'Xenova/whisper-tiny.en';
+      const FALLBACK = 'Xenova/whisper-tiny.en';
+      const rawGlobal = sm.get('localWhisperModel') ?? FALLBACK;
+      const globalModel = MODEL_CATALOG_IDS.has(rawGlobal) ? rawGlobal : FALLBACK;
       // Per-channel override: when enabled the two STT instances may load
       // different models (e.g. Moonshine Tiny for mic, Moonshine Base for
       // system audio). Falls back to globalModel if the per-channel slot is
-      // empty or the feature is disabled.
+      // empty, disabled, or holds a stale/invalid id (e.g. a legacy "off"
+      // marker from an older build) — an unknown id would otherwise crash the
+      // worker trying to fetch "huggingface.co/<id>/...".
       let modelId = globalModel;
       if (sm.get('localWhisperPerChannelEnabled')) {
-        const override = speaker === 'interviewer'
-          ? sm.get('localWhisperModelSystem')
-          : sm.get('localWhisperModelMic');
-        if (override) modelId = override;
+        const key = speaker === 'interviewer' ? 'localWhisperModelSystem' : 'localWhisperModelMic';
+        const override = sm.get(key);
+        if (override) {
+          if (MODEL_CATALOG_IDS.has(override)) {
+            modelId = override;
+          } else {
+            console.warn(`[Main] Per-channel ${key} "${override}" not in catalog — using ${globalModel}`);
+          }
+        }
       }
       console.log(`[Main] Using LocalWhisperSTT for ${speaker}, model: ${modelId}`);
       const lws = new LocalWhisperSTT(modelId);
