@@ -147,6 +147,46 @@ function isEnglishOnlyModel(id: string): boolean {
 const isEnglishOnlyRefusal = (e: any): boolean =>
   /English-only model/i.test(String(e?.message ?? e ?? ''));
 
+/**
+ * ONE INFERENCE AT A TIME. This is not an optimisation — DirectML requires it.
+ *
+ * ONNX Runtime documents the constraint plainly:
+ *
+ *   "As the DirectML execution provider does not support parallel execution, it
+ *    does not support multi-threaded calls to Run on the same inference session.
+ *    That is, if an inference session using the DirectML execution provider,
+ *    only one thread may call Run at a time."
+ *   — onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html
+ *
+ * The message handler is `async`, so every `transcribe` message starts its own
+ * independent execution and several `await pipe(...)` calls interleave freely.
+ * On the CPU that was invisible: ORT's CPU path blocks this thread, so the
+ * calls serialised themselves by accident. DirectML hands the work to the GPU
+ * and returns to the event loop, which lets the next message straight in — and
+ * then nothing ever comes back. Four concurrent runs on one session, none
+ * finishing:
+ *
+ *   transcribe STILL RUNNING task=s1 elapsed=37832ms audio=0.90s
+ *   transcribe STILL RUNNING task=t2 elapsed=24702ms audio=2.49s
+ *   transcribe STILL RUNNING task=t3 elapsed=24508ms audio=2.07s
+ *   transcribe STILL RUNNING task=t4 elapsed=8757ms  audio=4.56s
+ *
+ * The GPU showed real utilisation the whole time, which is why this looked like
+ * progress. It was a deadlock with the fans on.
+ *
+ * Serialising costs nothing on the CPU path — it was already effectively
+ * serial — and is the difference between working and hanging on DirectML.
+ */
+let inferenceLock: Promise<void> = Promise.resolve();
+
+function acquireInferenceLock(): Promise<() => void> {
+  let release!: () => void;
+  const next = new Promise<void>((resolve) => { release = resolve; });
+  const waitFor = inferenceLock;
+  inferenceLock = inferenceLock.then(() => next, () => next);
+  return waitFor.then(() => release, () => release);
+}
+
 if (!parentPort) throw new Error('whisperWorker must be run as a Worker thread');
 
 // Forward this worker's console output to the host so it lands in
@@ -683,6 +723,8 @@ parentPort.on('message', async (msg: any) => {
       parentPort!.postMessage({ type: 'error', message: 'Model not loaded' });
       return;
     }
+    // Wait for any run already in flight. See acquireInferenceLock().
+    const releaseInference = await acquireInferenceLock();
     try {
       let language: string | null = resolveWhisperLanguage(msg.language);
       const streaming: boolean = !!msg.streaming;
@@ -801,6 +843,9 @@ parentPort.on('message', async (msg: any) => {
         taskId: msg.taskId,
         message: `Transcription failed: ${e.message}`,
       });
+    } finally {
+      // Always hand the lock on, or one failure wedges the channel forever.
+      releaseInference();
     }
   }
 });
