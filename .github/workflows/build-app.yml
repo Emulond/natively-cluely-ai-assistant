@@ -12,10 +12,21 @@ name: Build App (unsigned)
 # afterPack ad-hoc signing step so arm64 builds will launch at all).
 #
 # Run it from the Actions tab > Build App (unsigned) > Run workflow, then grab
-# the artifacts from the finished run's summary page.
+# the artifacts from the finished run's summary page. The `platform` input
+# selects which OS to build; default is Windows only.
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Build target'
+        required: true
+        default: 'windows'
+        type: choice
+        options:
+          - windows
+          - macos
+          - both
 
 jobs:
   build:
@@ -27,13 +38,13 @@ jobs:
       # One platform failing should not deny you the other's artifact.
       fail-fast: false
       matrix:
-        include:
-          - os: macos-14
-            label: macOS (arm64 + x64)
-            artifact: natively-macos
-          - os: windows-latest
-            label: Windows (x64)
-            artifact: natively-windows
+        include: ${{ fromJSON(
+          inputs.platform == 'macos'
+            ? '[{"os":"macos-14","label":"macOS (arm64 + x64)","artifact":"natively-macos"}]'
+            : inputs.platform == 'both'
+              ? '[{"os":"macos-14","label":"macOS (arm64 + x64)","artifact":"natively-macos"},{"os":"windows-latest","label":"Windows (x64)","artifact":"natively-windows"}]'
+              : '[{"os":"windows-latest","label":"Windows (x64)","artifact":"natively-windows"}]'
+        ) }}
 
     steps:
       # No `submodules: recursive` here (unlike release-macos.yml): the premium
