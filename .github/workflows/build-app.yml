@@ -38,13 +38,14 @@ jobs:
       # One platform failing should not deny you the other's artifact.
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(
+        include: >-
+          ${{ fromJSON(
           inputs.platform == 'macos'
-            ? '[{"os":"macos-14","label":"macOS (arm64 + x64)","artifact":"natively-macos"}]'
-            : inputs.platform == 'both'
-              ? '[{"os":"macos-14","label":"macOS (arm64 + x64)","artifact":"natively-macos"},{"os":"windows-latest","label":"Windows (x64)","artifact":"natively-windows"}]'
-              : '[{"os":"windows-latest","label":"Windows (x64)","artifact":"natively-windows"}]'
-        ) }}
+          ? '[{"os":"macos-14","label":"macOS (arm64 + x64)","artifact":"natively-macos"}]'
+          : inputs.platform == 'both'
+          ? '[{"os":"macos-14","label":"macOS (arm64 + x64)","artifact":"natively-macos"},{"os":"windows-latest","label":"Windows (x64)","artifact":"natively-windows"}]'
+          : '[{"os":"windows-latest","label":"Windows (x64)","artifact":"natively-windows"}]'
+          ) }}
 
     steps:
       # No `submodules: recursive` here (unlike release-macos.yml): the premium
