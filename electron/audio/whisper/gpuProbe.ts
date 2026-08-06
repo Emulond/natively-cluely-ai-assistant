@@ -127,7 +127,32 @@ export async function orderedAdapterCandidates(): Promise<Array<{ deviceId: numb
             vendor: vendorName(d?.vendorId),
             discrete: d?.vendorId === VENDOR_NVIDIA || d?.vendorId === VENDOR_AMD,
         }));
+
+        // PRINT THE ENUMERATION, don't just act on it.
+        //
+        // "adapter 1 (NVIDIA)" is an INFERENCE: it reads vendorId 0x10DE at
+        // index 1 of Chromium's list and assumes that index is the same one
+        // DirectML's deviceId addresses. On Windows those orders normally agree
+        // — both derive from DXGI — but nothing in either API guarantees it, so
+        // a mismatch would mean quietly driving the integrated GPU while the log
+        // said NVIDIA. Logging the raw list makes that checkable against Task
+        // Manager instead of taken on trust.
+        console.log('[GpuProbe] adapters as enumerated: ' + JSON.stringify(
+            devices.map((d, index) => ({
+                index,
+                vendor: vendorName(d?.vendorId),
+                vendorId: d?.vendorId !== undefined ? `0x${Number(d.vendorId).toString(16)}` : 'unknown',
+                deviceId: d?.deviceId !== undefined ? `0x${Number(d.deviceId).toString(16)}` : 'unknown',
+                driver: d?.driverVersion ?? 'unknown',
+                active: d?.active ?? null,
+            })),
+        ));
+
         candidates.sort((a, b) => Number(b.discrete) - Number(a.discrete));
+        console.log(
+            '[GpuProbe] probe order (discrete first): ' +
+            candidates.map(c => `${c.deviceId}=${c.vendor}`).join(', '),
+        );
         return candidates.map(({ deviceId, vendor }) => ({ deviceId, vendor }));
     } catch {
         return [{ deviceId: 0, vendor: 'unknown' }];
